@@ -16,13 +16,18 @@ function registerSocketHandlers(io) {
 
     // ── createRoom ────────────────────────────────────────────────────────────
     // Payload: { wallet: string }
-    socket.on('createRoom', ({ wallet } = {}) => {
+    socket.on('createRoom', (payload = {}) => {
+      const { wallet } = payload;
+      console.log(`[Socket] createRoom received — socket: ${socket.id}, wallet: ${JSON.stringify(wallet)}`);
+
       if (!isValidWallet(wallet)) {
-        return socket.emit('errorMessage', { message: 'Invalid wallet address' });
+        console.warn(`[Socket] createRoom rejected — invalid wallet: ${JSON.stringify(wallet)}`);
+        return socket.emit('errorMessage', { message: `Invalid wallet address: "${wallet}". Expected a non-empty string.` });
       }
 
       const result = manager.createRoom(socket.id, wallet);
       if (!result.ok) {
+        console.warn(`[Socket] createRoom failed — ${result.error}`);
         return socket.emit('errorMessage', { message: result.error });
       }
 
@@ -39,9 +44,13 @@ function registerSocketHandlers(io) {
 
     // ── joinRoom ──────────────────────────────────────────────────────────────
     // Payload: { roomId: string, wallet: string }
-    socket.on('joinRoom', ({ roomId, wallet } = {}) => {
+    socket.on('joinRoom', (payload = {}) => {
+      const { roomId, wallet } = payload;
+      console.log(`[Socket] joinRoom received — socket: ${socket.id}, roomId: ${JSON.stringify(roomId)}, wallet: ${JSON.stringify(wallet)}`);
+
       if (!isValidWallet(wallet)) {
-        return socket.emit('errorMessage', { message: 'Invalid wallet address' });
+        console.warn(`[Socket] joinRoom rejected — invalid wallet: ${JSON.stringify(wallet)}`);
+        return socket.emit('errorMessage', { message: `Invalid wallet address: "${wallet}". Expected a non-empty string.` });
       }
       if (!roomId || typeof roomId !== 'string') {
         return socket.emit('errorMessage', { message: 'Invalid room ID' });
@@ -49,6 +58,7 @@ function registerSocketHandlers(io) {
 
       const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet);
       if (!result.ok) {
+        console.warn(`[Socket] joinRoom failed — ${result.error}`);
         return socket.emit('errorMessage', { message: result.error });
       }
 
@@ -65,9 +75,12 @@ function registerSocketHandlers(io) {
 
     // ── setReady ──────────────────────────────────────────────────────────────
     // Payload: { ready: boolean }
-    socket.on('setReady', ({ ready } = {}) => {
+    socket.on('setReady', (payload = {}) => {
+      const { ready } = payload;
+      console.log(`[Socket] setReady — socket: ${socket.id}, ready: ${ready}`);
       const room = manager.getRoomForSocket(socket.id);
       if (!room) {
+        console.warn(`[Socket] setReady failed — socket ${socket.id} is not in any room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
       }
       room.setReady(socket.id, ready);
@@ -76,8 +89,10 @@ function registerSocketHandlers(io) {
     // ── startGame ─────────────────────────────────────────────────────────────
     // No payload required
     socket.on('startGame', () => {
+      console.log(`[Socket] startGame — socket: ${socket.id}`);
       const room = manager.getRoomForSocket(socket.id);
       if (!room) {
+        console.warn(`[Socket] startGame failed — socket ${socket.id} is not in any room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
       }
       room.startGame(socket.id);
@@ -112,19 +127,13 @@ function registerSocketHandlers(io) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Loose wallet address validation.
- * Accepts EVM (0x…) addresses and Solana base58 addresses.
+ * Wallet address validation.
+ * Accepts any non-empty string — the server doesn't need to verify
+ * on-chain format; blockchain logic lives in the frontend.
+ * We only reject empty/missing values to catch obvious bugs.
  */
 function isValidWallet(wallet) {
-  if (typeof wallet !== 'string' || wallet.trim().length === 0) return false;
-
-  // EVM address: 0x followed by 40 hex chars
-  if (/^0x[0-9a-fA-F]{40}$/.test(wallet)) return true;
-
-  // Solana address: 32–44 base58 chars
-  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(wallet)) return true;
-
-  return false;
+  return typeof wallet === 'string' && wallet.trim().length > 0;
 }
 
 module.exports = { registerSocketHandlers };
