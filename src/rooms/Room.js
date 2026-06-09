@@ -11,31 +11,37 @@ const {
   PLAYER_COLORS,
 } = require('../game/constants');
 
+// How long to keep the room alive after matchEnded so late-reconnectors
+// can still receive the final state. After this the room is destroyed.
+const POST_MATCH_GRACE_MS = 30_000;
+
 /**
  * Room
  *
  * Manages the full lifecycle of a multi-round match.
  *
- * Round flow (all server-authoritative):
+ * ── Room lifecycle / destruction policy ──────────────────────────────────────
  *
- *   lobby
- *     └─ host calls startGame()
- *           ├─ emits gameStarted
- *           └─ _startRound() ──────────────────────────────────────────┐
- *                 └─ GameLoop runs one round                            │
- *                       └─ onRoundEnded(winnerId, winnerWallet)         │
- *                             ├─ _scores[wallet]++                     │
- *                             ├─ emits roundEnded                      │
- *                             ├─ if someone reached winsRequired:      │
- *                             │     _endMatch() → backend + matchEnded │
- *                             └─ else: setTimeout → _startRound() ─────┘
+ *  The room is NEVER destroyed while:
+ *    - state is 'playing'
+ *    - state is 'between_rounds' (countdown timer running)
+ *    - state is 'ended' but grace delay hasn't elapsed
  *
- * Win requirement: Math.ceil(rounds / 2)
- *   BO1 → 1 win   BO3 → 2 wins   BO5 → 3 wins
- *   BO7 → 4 wins  BO9 → 5 wins
+ *  Destruction sequence after matchEnded:
+ *    1. _endMatch() emits matchEnded
+ *    2. _endMatch() calls backend finish
+ *    3. setTimeout(POST_MATCH_GRACE_MS) fires
+ *    4. _releaseAllSockets() removes all socket→room mappings
+ *    5. onEmpty() → RoomManager._destroyRoom()
  *
- * The server NEVER trusts the frontend for:
- *   - scores        - round winner       - match winner      - payout
+ *  Player disconnect during a match:
+ *    - removePlayer() notes the player left but does NOT call onEmpty()
+ *      while the match is active — GameLoop is still running for others.
+ *    - releaseSocket(socketId) is called immediately so the socket slot
+ *      can be reused, but the room itself stays alive.
+ *
+ * ── Win requirement ───────────────────────────────────────────────────────────
+ *   BO1 → 1   BO3 → 2   BO5 → 3   BO7 → 4   BO9 → 5
  */
 class Room {
   /**
@@ -43,42 +49,44 @@ class Room {
    * @param {string}   opts.roomId
    * @param {string}   opts.hostId
    * @param {string}   opts.hostWallet
-   * @param {number}   opts.entryFee     integer units, default 0
-   * @param {number}   opts.rounds       1 | 3 | 5 | 7 | 9, default 1
-   * @param {Function} opts.emitToRoom   (event, data) → broadcast to room
-   * @param {Function} opts.emitToSocket (socketId, event, data) → one socket
-   * @param {Function} opts.onEmpty      called when last player leaves
+   * @param {number}   [opts.entryFee=0]
+   * @param {number}   [opts.rounds=1]     1|3|5|7|9
+   * @param {Function} opts.emitToRoom     (event, data)
+   * @param {Function} opts.emitToSocket   (socketId, event, data)
+   * @param {Function} opts.onEmpty        called when room can be destroyed
+   * @param {Function} opts.releaseSocket  (socketId) removes socket→room mapping
    */
   constructor({ roomId, hostId, hostWallet, entryFee = 0, rounds = DEFAULT_ROUNDS,
-                emitToRoom, emitToSocket, onEmpty }) {
+                emitToRoom, emitToSocket, onEmpty, releaseSocket }) {
     this.roomId   = roomId;
     this.hostId   = hostId;
-    this.state    = 'lobby';      // 'lobby' | 'playing' | 'between_rounds' | 'ended'
+    this.state    = 'lobby';
     this.entryFee = entryFee;
 
-    // ── Round / match config ────────────────────────────────────────────────
+    // ── Round config ────────────────────────────────────────────────────────
     this.rounds       = VALID_ROUNDS.includes(rounds) ? rounds : DEFAULT_ROUNDS;
     this.winsRequired = Math.ceil(this.rounds / 2);
-    this.currentRound = 0;        // increments to 1 when first round starts
+    this.currentRound = 0;
 
-    // ── Per-player win scores  wallet → wins ────────────────────────────────
-    this._scores = new Map();     // wallet → number of round wins
+    // ── Scores: wallet → wins ───────────────────────────────────────────────
+    this._scores = new Map();
 
-    // ── Player color assignment (stable across rounds) ──────────────────────
-    this._colors = new Map();     // socketId → hex color
+    // ── Stable colors across rounds: socketId → hex ─────────────────────────
+    this._colors = new Map();
 
     // ── IO ──────────────────────────────────────────────────────────────────
     this._emitToRoom    = emitToRoom;
     this._emitToSocket  = emitToSocket;
     this._onEmpty       = onEmpty;
+    this._releaseSocket = releaseSocket;
 
-    // ── Players / game state ────────────────────────────────────────────────
-    this._players      = new Map();   // socketId → { socketId, wallet, ready }
-    this._gameLoop     = null;
-    this._matchId      = null;
-    this._countdownTimer = null;      // setTimeout handle for between-rounds
+    // ── State ───────────────────────────────────────────────────────────────
+    this._players        = new Map();   // socketId → { socketId, wallet, ready }
+    this._gameLoop       = null;
+    this._matchId        = null;
+    this._countdownTimer = null;        // between-rounds setTimeout
+    this._graceTimer     = null;        // post-match grace setTimeout
 
-    // Add host as first player
     this._addPlayer(hostId, hostWallet);
 
     console.log(`[Room ${this.roomId}] Created — BO${this.rounds} (need ${this.winsRequired} wins)`);
@@ -88,15 +96,22 @@ class Room {
 
   _addPlayer(socketId, wallet) {
     this._players.set(socketId, { socketId, wallet, ready: false });
-    // Assign a stable color index based on join order
     if (!this._colors.has(socketId)) {
-      const idx = this._colors.size;
-      this._colors.set(socketId, PLAYER_COLORS[idx % PLAYER_COLORS.length]);
+      this._colors.set(socketId, PLAYER_COLORS[this._colors.size % PLAYER_COLORS.length]);
     }
-    // Initialise score entry for this wallet
     if (!this._scores.has(wallet)) {
       this._scores.set(wallet, 0);
     }
+  }
+
+  _getScores() {
+    return [...this._scores.entries()]
+      .map(([wallet, wins]) => ({ wallet, wins }))
+      .sort((a, b) => b.wins - a.wins);
+  }
+
+  _isMatchActive() {
+    return this.state === 'playing' || this.state === 'between_rounds';
   }
 
   // ─── Getters ─────────────────────────────────────────────────────────────────
@@ -105,13 +120,6 @@ class Room {
   get isFull()        { return this._players.size >= MAX_PLAYERS; }
   get hasMinPlayers() { return this._players.size >= MIN_PLAYERS; }
 
-  /** Serialised scores: [{ wallet, wins }] sorted by wins desc */
-  _getScores() {
-    return [...this._scores.entries()]
-      .map(([wallet, wins]) => ({ wallet, wins }))
-      .sort((a, b) => b.wins - a.wins);
-  }
-
   getLobbyState() {
     return {
       roomId:       this.roomId,
@@ -119,7 +127,6 @@ class Room {
       state:        this.state,
       entryFee:     this.entryFee,
       matchId:      this._matchId,
-      // Round info — always present so frontend can display format in lobby
       rounds:       this.rounds,
       winsRequired: this.winsRequired,
       currentRound: this.currentRound,
@@ -133,7 +140,7 @@ class Room {
     };
   }
 
-  // ─── Lobby: join / ready / rounds config ─────────────────────────────────────
+  // ─── Lobby actions ────────────────────────────────────────────────────────────
 
   join(socketId, wallet) {
     if (this.state !== 'lobby') {
@@ -145,7 +152,6 @@ class Room {
     if (this._players.has(socketId)) {
       return { ok: false, error: 'Already in room' };
     }
-
     this._addPlayer(socketId, wallet);
     console.log(`[Room ${this.roomId}] ${wallet} joined (${this._players.size}/${MAX_PLAYERS})`);
     this._emitToRoom('lobbyState', this.getLobbyState());
@@ -159,10 +165,6 @@ class Room {
     this._emitToRoom('lobbyState', this.getLobbyState());
   }
 
-  /**
-   * Host sets the round format (BO1/3/5/7/9) while in the lobby.
-   * Only the host may do this; silently ignored otherwise.
-   */
   setRounds(socketId, rounds) {
     if (socketId !== this.hostId) {
       this._emitToSocket(socketId, 'errorMessage', { message: 'Only the host can change the round format' });
@@ -178,7 +180,6 @@ class Room {
       });
       return;
     }
-
     this.rounds       = rounds;
     this.winsRequired = Math.ceil(rounds / 2);
     console.log(`[Room ${this.roomId}] Host set format: BO${rounds} (need ${this.winsRequired} wins)`);
@@ -202,7 +203,6 @@ class Room {
       });
       return;
     }
-
     const notReady = [...this._players.values()]
       .filter(p => p.socketId !== this.hostId && !p.ready);
     if (notReady.length > 0) {
@@ -212,7 +212,6 @@ class Room {
 
     this.state = 'playing';
 
-    // Broadcast match start with full config so frontend knows the format
     this._emitToRoom('gameStarted', {
       roomId:       this.roomId,
       rounds:       this.rounds,
@@ -224,7 +223,7 @@ class Room {
       })),
     });
 
-    // Register match in backend (fire-and-forget — game must not wait)
+    // Register match in backend — fire and forget, never block gameplay
     const walletList = [...this._players.values()].map(p => p.wallet);
     BackendClient.createMatch(this.roomId, this.entryFee)
       .then(match => {
@@ -239,16 +238,11 @@ class Room {
         console.error(`[Room ${this.roomId}] Backend registration error: ${err.message}`);
       });
 
-    // Start round 1
     this._startRound();
   }
 
   // ─── Round management ─────────────────────────────────────────────────────────
 
-  /**
-   * Starts a new GameLoop for the next round.
-   * Resets positions, trails and tick counter — scores are preserved.
-   */
   _startRound() {
     this.currentRound++;
     this.state = 'playing';
@@ -256,9 +250,8 @@ class Room {
     const playerIds = [...this._players.keys()];
     const wallets   = new Map([...this._players.entries()].map(([id, p]) => [id, p.wallet]));
 
-    console.log(`[Room ${this.roomId}] Starting round ${this.currentRound}/${this.rounds}`);
+    console.log(`[Room ${this.roomId}] ── roundStarted ${this.currentRound}/${this.rounds} ──`);
 
-    // Emit roundStarted so UI can show "Round X" splash
     this._emitToRoom('roundStarted', {
       roomId:       this.roomId,
       currentRound: this.currentRound,
@@ -270,19 +263,18 @@ class Room {
     this._gameLoop = new GameLoop({
       playerIds,
       wallets,
-      colors:       this._colors,          // stable colors across rounds
-      onGameState:  snap  => this._onGameState(snap),
-      onPlayerDied: (id, wallet, reason) => this._onPlayerDied(id, wallet, reason),
-      onRoundEnded: (winnerId, winnerWallet) => this._onRoundEnded(winnerId, winnerWallet),
+      colors:       this._colors,
+      onGameState:  snap                      => this._onGameState(snap),
+      onPlayerDied: (id, wallet, reason)      => this._onPlayerDied(id, wallet, reason),
+      onRoundEnded: (winnerId, winnerWallet)  => this._onRoundEnded(winnerId, winnerWallet),
     });
 
     this._gameLoop.start();
   }
 
   /**
-   * Called by GameLoop when one round finishes.
-   * Increments winner score, checks match-win condition,
-   * either ends the match or schedules the next round.
+   * Called by GameLoop when ≤1 player remains alive in a round.
+   * Never deletes the room — only _scheduleRoomCleanup() does that.
    */
   _onRoundEnded(winnerId, winnerWallet) {
     this._gameLoop = null;
@@ -290,73 +282,70 @@ class Room {
 
     const isDraw = winnerWallet === null;
 
-    // ── Increment score ───────────────────────────────────────────────────────
+    // ── Increment winner score ────────────────────────────────────────────────
     if (!isDraw && winnerWallet) {
-      const prev = this._scores.get(winnerWallet) ?? 0;
-      this._scores.set(winnerWallet, prev + 1);
+      this._scores.set(winnerWallet, (this._scores.get(winnerWallet) ?? 0) + 1);
     }
 
-    const scores       = this._getScores();
-    const topScore     = scores[0]?.wins ?? 0;
-    const matchWinner  = !isDraw && topScore >= this.winsRequired ? winnerWallet : null;
-    const matchWinnerId = matchWinner ? winnerId : null;
-    const matchOver    = matchWinner !== null;
+    const scores    = this._getScores();
+    const topScore  = scores[0]?.wins ?? 0;
+    const matchOver = !isDraw && topScore >= this.winsRequired;
+    const matchWinnerWallet = matchOver ? winnerWallet : null;
+    const matchWinnerId     = matchOver ? winnerId     : null;
 
     console.log(
-      `[Room ${this.roomId}] Round ${this.currentRound} ended — ` +
-      `winner: ${winnerWallet ?? 'draw'} | scores: ${JSON.stringify(scores)}`
+      `[Room ${this.roomId}] ── roundEnded ${this.currentRound} — ` +
+      `winner: ${winnerWallet ?? 'draw'} | scores: ${JSON.stringify(scores)} | matchOver: ${matchOver}`
     );
 
-    // ── Emit roundEnded (always, even on draw) ────────────────────────────────
-    // nextRoundStartsAt lets the frontend run a real countdown timer.
-    // scoreboard gives full player info for the between-rounds standings screen.
+    // ── Build scoreboard for UI ───────────────────────────────────────────────
     const nextRoundStartsAt = matchOver ? null : Date.now() + BETWEEN_ROUNDS_DELAY_MS;
 
     const scoreboard = [...this._players.values()].map(p => ({
-      socketId: p.socketId,
-      wallet:   p.wallet,
-      color:    this._colors.get(p.socketId) ?? '#FFFFFF',
-      wins:     this._scores.get(p.wallet) ?? 0,
+      socketId:      p.socketId,
+      wallet:        p.wallet,
+      color:         this._colors.get(p.socketId) ?? '#FFFFFF',
+      wins:          this._scores.get(p.wallet) ?? 0,
       isRoundWinner: p.wallet === winnerWallet,
     })).sort((a, b) => b.wins - a.wins);
 
+    // ── Emit roundEnded to all clients ────────────────────────────────────────
     this._emitToRoom('roundEnded', {
       roomId:            this.roomId,
       roundWinnerWallet: winnerWallet ?? null,
       roundWinnerId:     winnerId     ?? null,
       draw:              isDraw,
       scores,
-      scoreboard,           // full player info for standings UI
+      scoreboard,
       currentRound:      this.currentRound,
       rounds:            this.rounds,
       winsRequired:      this.winsRequired,
       matchOver,
-      nextRoundStartsAt,    // unix ms timestamp — null when matchOver
+      nextRoundStartsAt,
       countdownSeconds:  matchOver ? null : BETWEEN_ROUNDS_DELAY_MS / 1000,
     });
 
     if (matchOver) {
-      // ── Match winner reached winsRequired — end the match ─────────────────
-      this._endMatch(matchWinner, matchWinnerId);
+      this._endMatch(matchWinnerWallet, matchWinnerId);
     } else {
-      // ── Schedule next round after countdown ───────────────────────────────
-      console.log(`[Room ${this.roomId}] Next round in ${BETWEEN_ROUNDS_DELAY_MS}ms`);
+      // ── Schedule next round ───────────────────────────────────────────────
+      console.log(`[Room ${this.roomId}] Next round starts in ${BETWEEN_ROUNDS_DELAY_MS / 1000}s`);
       this._countdownTimer = setTimeout(() => {
         this._countdownTimer = null;
-        // Safety: room might have emptied during countdown
         if (this._players.size >= MIN_PLAYERS && this.state === 'between_rounds') {
           this._startRound();
         } else {
-          console.warn(`[Room ${this.roomId}] Countdown elapsed but room no longer viable — cancelling`);
+          console.warn(`[Room ${this.roomId}] Countdown done but not enough players — cancelling match`);
           if (this._matchId) BackendClient.cancelMatch(this._matchId).catch(() => {});
+          this._scheduleRoomCleanup();
         }
       }, BETWEEN_ROUNDS_DELAY_MS);
     }
   }
 
   /**
-   * End the entire match. Only called when a player reaches winsRequired.
-   * Emits matchEnded and calls the backend to trigger payout.
+   * End the entire match.
+   * Only called when a player reaches winsRequired.
    * NEVER called after individual rounds.
    */
   _endMatch(winnerWallet, winnerId) {
@@ -364,11 +353,11 @@ class Room {
     const isDraw = winnerWallet === null;
 
     console.log(
-      `[Room ${this.roomId}] MATCH ENDED after ${this.currentRound} rounds — ` +
+      `[Room ${this.roomId}] ── matchEnded after ${this.currentRound} rounds — ` +
       `winner: ${winnerWallet ?? 'draw'}`
     );
 
-    // ── 1. Broadcast final result to all clients ──────────────────────────────
+    // ── 1. Broadcast to all clients ───────────────────────────────────────────
     this._emitToRoom('matchEnded', {
       roomId:       this.roomId,
       winnerWallet: winnerWallet ?? null,
@@ -379,9 +368,7 @@ class Room {
       rounds:       this.rounds,
     });
 
-    // ── 2. Authoritative server-to-server backend call ────────────────────────
-    // Backend validates winner is a paid player before paying out.
-    // Frontend has NO way to trigger this (requires SERVER_SECRET).
+    // ── 2. Server-to-server backend call (authoritative payout) ───────────────
     if (this._matchId) {
       BackendClient.finishMatch(this._matchId, winnerWallet, winnerId, isDraw)
         .catch(err => {
@@ -390,6 +377,28 @@ class Room {
     } else {
       console.warn(`[Room ${this.roomId}] matchEnded but no matchId — backend not notified`);
     }
+
+    // ── 3. Schedule room cleanup after grace period ───────────────────────────
+    this._scheduleRoomCleanup();
+  }
+
+  /**
+   * Destroys the room after POST_MATCH_GRACE_MS.
+   * Releases all socket mappings first so they can be reused.
+   * Then calls onEmpty() so RoomManager removes the room from its map.
+   */
+  _scheduleRoomCleanup() {
+    console.log(`[Room ${this.roomId}] Cleanup scheduled in ${POST_MATCH_GRACE_MS / 1000}s`);
+    this._graceTimer = setTimeout(() => {
+      this._graceTimer = null;
+      this._stopEverything();
+      console.log(`[Room ${this.roomId}] ── room cleanup — releasing all sockets`);
+      // Release all socket→room mappings
+      for (const socketId of this._players.keys()) {
+        this._releaseSocket(socketId);
+      }
+      this._onEmpty();
+    }, POST_MATCH_GRACE_MS);
   }
 
   // ─── Input ───────────────────────────────────────────────────────────────────
@@ -401,47 +410,61 @@ class Room {
     this._gameLoop.setInput(socketId, direction);
   }
 
-  // ─── Leave / disconnect ───────────────────────────────────────────────────────
+  // ─── Player disconnect ────────────────────────────────────────────────────────
 
   removePlayer(socketId) {
     if (!this._players.has(socketId)) return;
 
     const player = this._players.get(socketId);
     this._players.delete(socketId);
-    console.log(`[Room ${this.roomId}] ${player.wallet} left`);
+    console.log(`[Room ${this.roomId}] ${player.wallet} disconnected`);
 
-    if (this._players.size === 0) {
-      this._cleanup();
-      this._onEmpty();
+    // Always release the socket slot immediately so it can reconnect elsewhere
+    this._releaseSocket(socketId);
+
+    // ── Lobby: normal empty-room cleanup ─────────────────────────────────────
+    if (this.state === 'lobby') {
+      if (this._players.size === 0) {
+        this._onEmpty();
+        return;
+      }
+      if (socketId === this.hostId) {
+        this.hostId = [...this._players.keys()][0];
+        console.log(`[Room ${this.roomId}] Host migrated to ${this.hostId}`);
+      }
+      this._emitToRoom('lobbyState', this.getLobbyState());
       return;
     }
 
-    // Migrate host
-    if (socketId === this.hostId) {
-      this.hostId = [...this._players.keys()][0];
-      console.log(`[Room ${this.roomId}] Host migrated to ${this.hostId}`);
+    // ── Match active: do NOT destroy the room ─────────────────────────────────
+    // The GameLoop keeps running for the remaining players.
+    // If only 1 player remains during a round, GameLoop's win-condition
+    // fires naturally on the next tick and _onRoundEnded handles it.
+    // We only force-end if the room is between rounds and now under-staffed.
+    if (this.state === 'between_rounds' && this._players.size < MIN_PLAYERS) {
+      console.warn(`[Room ${this.roomId}] Not enough players during countdown — ending match early`);
+      if (this._countdownTimer) {
+        clearTimeout(this._countdownTimer);
+        this._countdownTimer = null;
+      }
+      if (this._matchId) BackendClient.cancelMatch(this._matchId).catch(() => {});
+      this._scheduleRoomCleanup();
     }
 
-    if (this.state === 'lobby') {
-      this._emitToRoom('lobbyState', this.getLobbyState());
-    }
+    // ── Ended: nothing to do — grace timer is already running ─────────────────
   }
 
-  _cleanup() {
-    // Stop active game loop
+  // ─── Internal cleanup ────────────────────────────────────────────────────────
+
+  _stopEverything() {
     this._gameLoop?.stop();
     this._gameLoop = null;
 
-    // Clear any pending between-rounds countdown
     if (this._countdownTimer) {
       clearTimeout(this._countdownTimer);
       this._countdownTimer = null;
     }
-
-    // Cancel match in backend if it was never finished
-    if (this._matchId && this.state !== 'ended') {
-      BackendClient.cancelMatch(this._matchId).catch(() => {});
-    }
+    // Note: _graceTimer is NOT cleared here — it called us
   }
 
   // ─── Game state passthrough ───────────────────────────────────────────────────
@@ -451,6 +474,7 @@ class Room {
   }
 
   _onPlayerDied(socketId, wallet, reason) {
+    console.log(`[Room ${this.roomId}] playerDied — wallet: ${wallet}, reason: ${reason}`);
     this._emitToRoom('playerDied', { socketId, wallet, reason });
   }
 }

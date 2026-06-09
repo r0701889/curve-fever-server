@@ -3,7 +3,6 @@
 const {
   PLAYER_SPEED,
   TURN_RATE,
-  PLAYER_RADIUS,
   TRAIL_GAP_INTERVAL,
   TRAIL_GAP_DURATION,
   TICK_INTERVAL_MS,
@@ -16,47 +15,65 @@ const { generateSpawns } = require('./spawn');
 /**
  * GameLoop
  *
- * Owns the authoritative game state for one room.
- * Does NOT know about Socket.io — it receives callbacks for output.
+ * Runs ONE round of the game.
+ * Multi-round orchestration lives in Room.js — this class knows nothing about
+ * rounds, scores, or match winners. It only knows about a single round.
  *
- * @param {object} opts
- * @param {string[]}  opts.playerIds      ordered array of socket IDs
- * @param {Map<string,string>} opts.wallets  socketId → walletAddress
- * @param {Function}  opts.onGameState    called each tick with (gameState)
- * @param {Function}  opts.onPlayerDied   called when a player dies (playerId, walletAddress)
- * @param {Function}  opts.onMatchEnded   called with (winnerWallet, winnerId)
+ * Callbacks:
+ *   onGameState(snapshot)            — called every tick while running
+ *   onPlayerDied(id, wallet, reason) — called when a player dies
+ *   onRoundEnded(winnerId, wallets)  — called with the round winner (null = draw)
  */
 class GameLoop {
-  constructor({ playerIds, wallets, onGameState, onPlayerDied, onMatchEnded }) {
-    this._playerIds   = [...playerIds];
-    this._wallets     = wallets;            // Map<socketId, walletAddress>
-    this._onGameState = onGameState;
+  /**
+   * @param {object} opts
+   * @param {string[]}              opts.playerIds   ordered socket ID list
+   * @param {Map<string,string>}    opts.wallets     socketId → walletAddress
+   * @param {Map<string,string>}    opts.colors      socketId → hex color (preserved across rounds)
+   * @param {Function}              opts.onGameState
+   * @param {Function}              opts.onPlayerDied
+   * @param {Function}              opts.onRoundEnded
+   */
+  constructor({ playerIds, wallets, colors, onGameState, onPlayerDied, onRoundEnded }) {
+    this._playerIds    = [...playerIds];
+    this._wallets      = wallets;
+    this._colors       = colors;          // keeps colors stable across rounds
+    this._onGameState  = onGameState;
     this._onPlayerDied = onPlayerDied;
-    this._onMatchEnded = onMatchEnded;
+    this._onRoundEnded = onRoundEnded;
 
-    this._tick        = 0;
-    this._intervalId  = null;
-    this._running     = false;
-
-    // Build per-player state
-    const spawns = generateSpawns(this._playerIds.length);
+    this._tick       = 0;
+    this._intervalId = null;
+    this._running    = false;
 
     this._players = new Map();
     this._trails  = new Map();   // socketId → Array<{x, y, gap}>
     this._inputs  = new Map();   // socketId → 'left' | 'right' | 'neutral'
+
+    this._initPlayers();
+  }
+
+  // ─── Init / Reset ────────────────────────────────────────────────────────────
+
+  _initPlayers() {
+    const spawns = generateSpawns(this._playerIds.length);
+
+    this._players.clear();
+    this._trails.clear();
+    this._inputs.clear();
 
     this._playerIds.forEach((id, idx) => {
       const spawn = spawns[idx];
 
       this._players.set(id, {
         id,
-        wallet:   wallets.get(id) || id,
-        color:    PLAYER_COLORS[idx % PLAYER_COLORS.length],
-        x:        spawn.x,
-        y:        spawn.y,
-        angle:    spawn.angle,
-        alive:    true,
-        score:    0,
+        wallet: this._wallets.get(id) || id,
+        // Color from preserved map, falling back to index-based default
+        color:  this._colors?.get(id) ?? PLAYER_COLORS[idx % PLAYER_COLORS.length],
+        x:      spawn.x,
+        y:      spawn.y,
+        angle:  spawn.angle,
+        alive:  true,
       });
 
       this._trails.set(id, []);
@@ -64,13 +81,13 @@ class GameLoop {
     });
   }
 
-  // ─── Public API ─────────────────────────────────────────────────────────────
+  // ─── Public API ──────────────────────────────────────────────────────────────
 
   start() {
     if (this._running) return;
     this._running    = true;
     this._intervalId = setInterval(() => this._step(), TICK_INTERVAL_MS);
-    console.log('[GameLoop] Started');
+    console.log('[GameLoop] Round started');
   }
 
   stop() {
@@ -78,7 +95,7 @@ class GameLoop {
     this._running = false;
     clearInterval(this._intervalId);
     this._intervalId = null;
-    console.log('[GameLoop] Stopped');
+    console.log('[GameLoop] Round stopped');
   }
 
   setInput(playerId, direction) {
@@ -92,13 +109,13 @@ class GameLoop {
   _step() {
     this._tick++;
 
-    const alivePlayers = [];
+    const aliveBefore = [];
 
     for (const [id, player] of this._players) {
       if (!player.alive) continue;
-      alivePlayers.push(id);
+      aliveBefore.push(id);
 
-      // 1. Apply turning input
+      // 1. Apply turning
       const input = this._inputs.get(id);
       if (input === 'left')  player.angle -= TURN_RATE;
       if (input === 'right') player.angle += TURN_RATE;
@@ -125,17 +142,16 @@ class GameLoop {
       this._trails.get(id).push({ x: newX, y: newY, gap: isGap });
     }
 
-    // 6. Win condition — evaluated after all players are updated
-    const stillAlive = alivePlayers.filter(id => this._players.get(id).alive);
+    // 6. Check round end condition
+    const stillAlive = aliveBefore.filter(id => this._players.get(id).alive);
 
     if (stillAlive.length <= 1) {
-      const winnerId = stillAlive[0] ?? null;
-      this._endMatch(winnerId);
+      this._endRound(stillAlive[0] ?? null);
       return;
     }
 
     // 7. Broadcast game state
-    this._onGameState(this._buildStateSnapshot());
+    this._onGameState(this._buildSnapshot());
   }
 
   // ─── Trail Gap Logic ─────────────────────────────────────────────────────────
@@ -155,60 +171,37 @@ class GameLoop {
     this._onPlayerDied(id, player.wallet, reason);
   }
 
-  // ─── End Match ───────────────────────────────────────────────────────────────
+  // ─── End Round ───────────────────────────────────────────────────────────────
 
-  _endMatch(winnerId) {
+  _endRound(winnerId) {
     this.stop();
-
-    const winner     = winnerId ? this._players.get(winnerId) : null;
-    const winnerWallet = winner ? winner.wallet : null;
-
-    console.log(`[GameLoop] Match ended — winner: ${winnerWallet ?? 'none (draw)'}`);
-    this._onMatchEnded(winnerWallet, winnerId);
+    const winnerWallet = winnerId ? this._players.get(winnerId)?.wallet ?? null : null;
+    console.log(`[GameLoop] Round ended — winner: ${winnerWallet ?? 'draw'}`);
+    this._onRoundEnded(winnerId, winnerWallet);
   }
 
   // ─── State Snapshot ──────────────────────────────────────────────────────────
 
-  _buildStateSnapshot() {
+  _buildSnapshot() {
     const players = [];
-
-    for (const [, player] of this._players) {
+    for (const [, p] of this._players) {
       players.push({
-        id:     player.id,
-        wallet: player.wallet,
-        color:  player.color,
-        x:      +player.x.toFixed(2),
-        y:      +player.y.toFixed(2),
-        angle:  +player.angle.toFixed(4),
-        alive:  player.alive,
+        id:    p.id,
+        wallet: p.wallet,
+        color:  p.color,
+        x:     +p.x.toFixed(2),
+        y:     +p.y.toFixed(2),
+        angle: +p.angle.toFixed(4),
+        alive:  p.alive,
       });
     }
 
-    // Send full trail data on first tick, then only new points to reduce bandwidth
     const trails = {};
     for (const [id, trail] of this._trails) {
-      // Send the last few points each tick; client maintains the full trail locally
-      const recent = trail.slice(-4);
-      trails[id] = recent;
+      trails[id] = trail.slice(-4);   // client appends; we only send recent points
     }
 
-    return {
-      tick:    this._tick,
-      players,
-      trails,
-    };
-  }
-
-  /**
-   * Full trail dump — sent once when the game starts so the client
-   * can seed its local trail store.
-   */
-  getFullTrailSnapshot() {
-    const trails = {};
-    for (const [id, trail] of this._trails) {
-      trails[id] = trail;
-    }
-    return trails;
+    return { tick: this._tick, players, trails };
   }
 }
 
