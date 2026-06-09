@@ -24,6 +24,13 @@ const TICK_INTERVAL_MS    = 1000 / TICK_RATE;
 const MIN_PLAYERS         = 2;
 const MAX_PLAYERS         = 6;
 
+// ─── Multi-round ──────────────────────────────────────────────────────────────
+
+// Allowed Best-of formats. Wins required = Math.ceil(rounds / 2)
+const VALID_ROUNDS             = [1, 3, 5, 7, 9];
+const DEFAULT_ROUNDS           = 1;
+const BETWEEN_ROUNDS_DELAY_MS  = 10000; // 10 second countdown between rounds
+
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
 const SPAWN_MARGIN        = 80;    // min distance from arena edge when spawning
@@ -51,6 +58,9 @@ module.exports = {
   TICK_INTERVAL_MS,
   MIN_PLAYERS,
   MAX_PLAYERS,
+  VALID_ROUNDS,
+  DEFAULT_ROUNDS,
+  BETWEEN_ROUNDS_DELAY_MS,
   SPAWN_MARGIN,
   PLAYER_COLORS,
 };
