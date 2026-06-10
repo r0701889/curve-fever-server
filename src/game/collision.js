@@ -1,7 +1,10 @@
+'use strict';
+
 const { PLAYER_RADIUS, ARENA_WIDTH, ARENA_HEIGHT } = require('./constants');
 
 /**
- * Returns true if (x, y) is outside the arena walls.
+ * Returns true if the player head at (x,y) touches an arena wall.
+ * Always lethal — Ghost and Shield do NOT protect against walls.
  */
 function collidesWithWall(x, y) {
   return (
@@ -13,32 +16,33 @@ function collidesWithWall(x, y) {
 }
 
 /**
- * Returns true if the circle at (x, y) with PLAYER_RADIUS
- * overlaps any segment in the trails array.
- *
- * Each trail entry is { x, y } — we treat each as a disc of PLAYER_RADIUS.
- * We skip the most-recent N points of the *owner's* trail to avoid
- * self-collision on the head (the "nose" of the snake).
+ * Returns true if the circle at (x, y) overlaps any trail point.
  *
  * @param {number} x
  * @param {number} y
- * @param {Map<string, Array<{x:number,y:number,gap:boolean}>>} allTrails  playerId → trail points
- * @param {string} ownerId  the player whose head we're testing
+ * @param {Map<string, Array<{x,y,gap,r}>>} allTrails  playerId → trail points
+ *        Each point may carry an optional `r` (stored radius) for Fat/Tiny Trail.
+ * @param {string} ownerId           player whose head we're testing
+ * @param {number} [headRadius]      override for head collision radius (default PLAYER_RADIUS)
  */
-function collidesWithTrails(x, y, allTrails, ownerId) {
-  const SELF_SKIP = 8; // ignore the last N points of own trail
+function collidesWithTrails(x, y, allTrails, ownerId, headRadius = PLAYER_RADIUS) {
+  const SELF_SKIP = 8;
 
   for (const [playerId, trail] of allTrails) {
     const limit = playerId === ownerId ? trail.length - SELF_SKIP : trail.length;
 
     for (let i = 0; i < limit; i++) {
       const point = trail[i];
-      if (point.gap) continue; // gap points are passable
+      if (point.gap) continue;
 
       const dx = x - point.x;
       const dy = y - point.y;
       const distSq = dx * dx + dy * dy;
-      const minDist = PLAYER_RADIUS * 2;
+
+      // Trail point radius comes from the point itself (set when trail owner had
+      // Fat/Tiny Trail active) or defaults to PLAYER_RADIUS.
+      const trailR = point.r ?? PLAYER_RADIUS;
+      const minDist = headRadius + trailR;
 
       if (distSq < minDist * minDist) {
         return true;

@@ -4,30 +4,47 @@ const { RoomManager } = require('./RoomManager');
 const { VALID_ROUNDS, DEFAULT_ROUNDS } = require('../game/constants');
 
 /**
- * Registers all Socket.io event handlers.
+ * ── Client → Server ───────────────────────────────────────────────────────────
  *
- * Client → Server events:
- *   createRoom    { wallet, rounds? }
- *   joinRoom      { roomId, wallet }
- *   setRounds     { rounds }           host only, lobby only
- *   setReady      { ready }
- *   startGame     (no payload)
- *   playerInput   { direction }
+ *   createRoom   { wallet, username?, rounds?, entryFee? }
+ *   joinRoom     { roomId, wallet, username? }
+ *   setRounds    { rounds }                        host only, lobby only
+ *   setReady     { ready }
+ *   startGame    (no payload)                      host only
+ *   playerInput  { direction }                     'left'|'right'|'neutral'
+ *   playAgain    { roomId, wallet }                after matchEnded
+ *   exitMatch    { roomId, wallet }                after matchEnded
  *
- * Server → Client events:
- *   roomCreated   { roomId, lobbyState }
- *   roomJoined    { roomId, lobbyState }
- *   lobbyState    { roomId, hostId, state, entryFee, matchId, rounds,
- *                   winsRequired, currentRound, scores, players }
- *   gameStarted   { roomId, rounds, winsRequired, players }
- *   roundStarted  { roomId, currentRound, rounds, winsRequired, scores }
- *   gameState     { tick, players, trails }              — 30×/sec
- *   playerDied    { socketId, wallet, reason }
- *   roundEnded    { roomId, roundWinnerWallet, roundWinnerId, draw,
- *                   scores, currentRound, rounds, winsRequired, matchOver }
- *   matchEnded    { roomId, winnerWallet, winnerId, draw,
- *                   scores, totalRounds, rounds }
- *   errorMessage  { message }
+ * ── Server → Client ───────────────────────────────────────────────────────────
+ *
+ *   roomCreated          { roomId, lobbyState }
+ *   roomJoined           { roomId, lobbyState }
+ *   lobbyState           { roomId, hostId, state, entryFee, matchId, rounds,
+ *                          winsRequired, currentRound, scoreboard, players }
+ *   gameStarted          { roomId, rounds, winsRequired, scoreboard, players }
+ *   roundStarted         { roomId, currentRound, rounds, winsRequired, scoreboard }
+ *   gameState            { tick, players, trails, scoreboard, powerUps }  — 60×/sec
+ *   playerDied           { socketId, wallet, reason }
+ *   scoreboardUpdate     { scoreboard }
+ *   roundEnded           { roomId, roundWinnerWallet, roundWinnerId, draw,
+ *                          scoreboard, currentRound, rounds, winsRequired,
+ *                          matchOver, nextRoundStartsAt, countdownSeconds }
+ *   matchEnded           { roomId, winnerWallet, winnerId, draw,
+ *                          scoreboard, totalRounds, rounds }
+ *   rematchLobbyCreated  { roomId, lobbyState }    — broadcast to room when first
+ *                                                     player clicks playAgain
+ *   rematchJoined        { roomId, lobbyState }    — sent to joining player only
+ *   lobbyFull            { message }               — sent when rematch lobby full
+ *   powerUpsUpdate       { powerUps }
+ *   powerUpCollected     { socketId, playerWallet, playerUsername, type, duration }
+ *   powerUpExpired       { socketId, playerWallet, type }
+ *   powerUpUsed          { socketId, playerWallet, type }
+ *   errorMessage         { message }
+ *
+ * ── Scoreboard format ────────────────────────────────────────────────────────
+ *
+ *   [{ wallet, username, color, wins, alive, rank, activePowerUp }]
+ *   activePowerUp: { type, remainingMs } | null
  */
 function registerSocketHandlers(io) {
   const manager = new RoomManager(io);
@@ -36,119 +53,124 @@ function registerSocketHandlers(io) {
     console.log(`[Socket] Connected: ${socket.id}`);
 
     // ── createRoom ─────────────────────────────────────────────────────────────
-    // Payload: { wallet: string, rounds?: 1|3|5|7|9, entryFee?: number }
     socket.on('createRoom', (payload = {}) => {
-      const { wallet, rounds, entryFee } = payload;
+      const { wallet, username, rounds, entryFee } = payload;
       console.log(`[Socket] createRoom — socket: ${socket.id}, wallet: ${JSON.stringify(wallet)}, rounds: ${rounds}`);
 
       if (!isValidWallet(wallet)) {
-        return socket.emit('errorMessage', {
-          message: `Invalid wallet address: "${wallet}". Expected a non-empty string.`,
-        });
+        return socket.emit('errorMessage', { message: `Invalid wallet address: "${wallet}".` });
       }
 
-      // Validate rounds — fall back to default if not provided or invalid
-      const validatedRounds = VALID_ROUNDS.includes(rounds) ? rounds : DEFAULT_ROUNDS;
-      const validatedFee    = Number.isInteger(entryFee) && entryFee >= 0 ? entryFee : 0;
+      const validatedRounds   = VALID_ROUNDS.includes(rounds) ? rounds : DEFAULT_ROUNDS;
+      const validatedFee      = Number.isInteger(entryFee) && entryFee >= 0 ? entryFee : 0;
+      const validatedUsername = sanitizeUsername(username, wallet);
 
-      const result = manager.createRoom(socket.id, wallet, validatedRounds, validatedFee);
-      if (!result.ok) {
-        return socket.emit('errorMessage', { message: result.error });
-      }
+      const result = manager.createRoom(socket.id, wallet, validatedUsername, validatedRounds, validatedFee);
+      if (!result.ok) return socket.emit('errorMessage', { message: result.error });
 
       const { room } = result;
       socket.join(room.roomId);
-
-      socket.emit('roomCreated', {
-        roomId:     room.roomId,
-        lobbyState: room.getLobbyState(),
-      });
-
-      console.log(`[Socket] ${wallet} created room ${room.roomId} — BO${validatedRounds}`);
+      socket.emit('roomCreated', { roomId: room.roomId, lobbyState: room.getLobbyState() });
+      console.log(`[Socket] ${validatedUsername} (${wallet}) created room ${room.roomId}`);
     });
 
     // ── joinRoom ───────────────────────────────────────────────────────────────
-    // Payload: { roomId: string, wallet: string }
     socket.on('joinRoom', (payload = {}) => {
-      const { roomId, wallet } = payload;
+      const { roomId, wallet, username } = payload;
       console.log(`[Socket] joinRoom — socket: ${socket.id}, roomId: ${JSON.stringify(roomId)}, wallet: ${JSON.stringify(wallet)}`);
 
       if (!isValidWallet(wallet)) {
-        return socket.emit('errorMessage', {
-          message: `Invalid wallet address: "${wallet}". Expected a non-empty string.`,
-        });
+        return socket.emit('errorMessage', { message: `Invalid wallet address: "${wallet}".` });
       }
       if (!roomId || typeof roomId !== 'string') {
         return socket.emit('errorMessage', { message: 'Invalid room ID' });
       }
 
-      const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet);
-      if (!result.ok) {
-        return socket.emit('errorMessage', { message: result.error });
-      }
+      const validatedUsername = sanitizeUsername(username, wallet);
+      const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
+      if (!result.ok) return socket.emit('errorMessage', { message: result.error });
 
       const { room } = result;
       socket.join(room.roomId);
-
-      socket.emit('roomJoined', {
-        roomId:     room.roomId,
-        lobbyState: room.getLobbyState(),
-      });
-
-      console.log(`[Socket] ${wallet} joined room ${room.roomId}`);
+      socket.emit('roomJoined', { roomId: room.roomId, lobbyState: room.getLobbyState() });
+      console.log(`[Socket] ${validatedUsername} (${wallet}) joined room ${room.roomId}`);
     });
 
     // ── setRounds ──────────────────────────────────────────────────────────────
-    // Host changes the BO format while in the lobby.
-    // Payload: { rounds: 1|3|5|7|9 }
     socket.on('setRounds', (payload = {}) => {
-      const { rounds } = payload;
-      console.log(`[Socket] setRounds — socket: ${socket.id}, rounds: ${rounds}`);
-
       const room = manager.getRoomForSocket(socket.id);
-      if (!room) {
-        return socket.emit('errorMessage', { message: 'You are not in a room' });
-      }
-
-      room.setRounds(socket.id, rounds);
+      if (!room) return socket.emit('errorMessage', { message: 'You are not in a room' });
+      room.setRounds(socket.id, payload.rounds);
     });
 
     // ── setReady ───────────────────────────────────────────────────────────────
-    // Payload: { ready: boolean }
     socket.on('setReady', (payload = {}) => {
-      const { ready } = payload;
-      console.log(`[Socket] setReady — socket: ${socket.id}, ready: ${ready}`);
-
+      console.log(`[Socket] setReady — socket: ${socket.id}, ready: ${payload.ready}`);
       const room = manager.getRoomForSocket(socket.id);
       if (!room) {
-        console.warn(`[Socket] setReady failed — socket ${socket.id} not in a room`);
+        console.warn(`[Socket] setReady failed — ${socket.id} not in a room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
       }
-
-      room.setReady(socket.id, ready);
+      room.setReady(socket.id, payload.ready);
     });
 
     // ── startGame ──────────────────────────────────────────────────────────────
-    // No payload — host only
     socket.on('startGame', () => {
       console.log(`[Socket] startGame — socket: ${socket.id}`);
-
       const room = manager.getRoomForSocket(socket.id);
       if (!room) {
-        console.warn(`[Socket] startGame failed — socket ${socket.id} not in a room`);
+        console.warn(`[Socket] startGame failed — ${socket.id} not in a room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
       }
-
       room.startGame(socket.id);
     });
 
     // ── playerInput ────────────────────────────────────────────────────────────
-    // Payload: { direction: 'left' | 'right' | 'neutral' }
     socket.on('playerInput', (payload = {}) => {
-      const { direction } = payload;
       const room = manager.getRoomForSocket(socket.id);
-      if (!room) return;   // silently ignore stale inputs
-      room.handleInput(socket.id, direction);
+      if (!room) return;
+      room.handleInput(socket.id, payload.direction);
+    });
+
+    // ── playAgain ──────────────────────────────────────────────────────────────
+    // Payload: { roomId: string, wallet: string }
+    // Player wants to rematch after matchEnded.
+    socket.on('playAgain', (payload = {}) => {
+      const { roomId, wallet } = payload;
+      console.log(`[Socket] playAgain — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
+
+      if (!isValidWallet(wallet)) {
+        return socket.emit('errorMessage', { message: 'Invalid wallet address' });
+      }
+      if (!roomId || typeof roomId !== 'string') {
+        return socket.emit('errorMessage', { message: 'Invalid room ID' });
+      }
+
+      const result = manager.playAgain(socket.id, wallet);
+
+      if (!result.ok) {
+        if (result.error === 'Lobby is full') {
+          // Use dedicated lobbyFull event as specified
+          return socket.emit('lobbyFull', { message: 'Lobby is full' });
+        }
+        return socket.emit('errorMessage', { message: result.error });
+      }
+    });
+
+    // ── exitMatch ──────────────────────────────────────────────────────────────
+    // Payload: { roomId: string, wallet: string }
+    // Player explicitly leaves the ended/rematch room.
+    socket.on('exitMatch', (payload = {}) => {
+      const { roomId, wallet } = payload;
+      console.log(`[Socket] exitMatch — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
+
+      const result = manager.exitMatch(socket.id);
+      if (!result.ok) {
+        return socket.emit('errorMessage', { message: result.error ?? 'Could not exit room' });
+      }
+
+      // Leave the Socket.io room channel
+      if (roomId) socket.leave(roomId.toUpperCase());
     });
 
     // ── disconnect ─────────────────────────────────────────────────────────────
@@ -170,6 +192,14 @@ function registerSocketHandlers(io) {
 
 function isValidWallet(wallet) {
   return typeof wallet === 'string' && wallet.trim().length > 0;
+}
+
+function sanitizeUsername(username, wallet) {
+  if (typeof username === 'string' && username.trim().length > 0) {
+    return username.trim().slice(0, 20);
+  }
+  const w = String(wallet);
+  return w.length > 10 ? `${w.slice(0, 6)}…${w.slice(-4)}` : w;
 }
 
 module.exports = { registerSocketHandlers };
