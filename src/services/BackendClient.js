@@ -10,8 +10,9 @@
  * These calls happen server-to-server only.
  */
 
-const BACKEND_URL   = process.env.BACKEND_URL;
-const SERVER_SECRET = process.env.SERVER_SECRET;
+const BACKEND_URL            = process.env.BACKEND_URL;
+const SERVER_SECRET          = process.env.SERVER_SECRET;
+const RAILWAY_INTERNAL_TOKEN = process.env.RAILWAY_INTERNAL_TOKEN;
 
 // ─── Startup validation ───────────────────────────────────────────────────────
 
@@ -21,11 +22,15 @@ if (!BACKEND_URL) {
 if (!SERVER_SECRET) {
   console.warn('[BackendClient] WARNING: SERVER_SECRET is not set — backend calls will fail auth');
 }
+if (!RAILWAY_INTERNAL_TOKEN) {
+  console.warn('[BackendClient] WARNING: RAILWAY_INTERNAL_TOKEN is not set — /finish calls will be rejected');
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /**
  * Makes an authenticated POST to the backend.
+ * Uses Authorization: Bearer SERVER_SECRET for all general endpoints.
  * Throws on non-2xx responses.
  */
 async function post(path, body) {
@@ -62,6 +67,50 @@ async function post(path, body) {
   return response.json();
 }
 
+/**
+ * Makes a POST to /finish with the dedicated x-railway-token header.
+ * This header is checked by requireRailwayToken middleware on the backend.
+ * Separate from post() so the token is ONLY sent to the /finish endpoint.
+ */
+async function postFinish(path, body) {
+  if (!BACKEND_URL) {
+    console.warn(`[BackendClient] Skipping POST ${path} — BACKEND_URL not configured`);
+    return null;
+  }
+
+  if (!RAILWAY_INTERNAL_TOKEN) {
+    console.error('[BackendClient] RAILWAY_INTERNAL_TOKEN not set — cannot call /finish');
+    return null;
+  }
+
+  const url = `${BACKEND_URL.replace(/\/$/, '')}${path}`;
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method:  'POST',
+      headers: {
+        'Content-Type':    'application/json',
+        'x-railway-token': RAILWAY_INTERNAL_TOKEN,
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (networkErr) {
+    console.error(`[BackendClient] Network error POST ${path}: ${networkErr.message}`);
+    throw networkErr;
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    console.error(`[BackendClient] POST ${path} failed: ${response.status} ${text}`);
+    const err = new Error(`Backend returned ${response.status}: ${text}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  return response.json();
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
@@ -69,9 +118,9 @@ async function post(path, body) {
  * @param {string} roomId
  * @param {number} entryFee
  */
-async function createMatch(roomId, entryFee = 0) {
+async function createMatch(roomId, entryFee = 0, maxPlayers = 6, totalRounds = 1, gameType = 'curve_fever') {
   try {
-    const result = await post('/api/matches', { roomId, entryFee });
+    const result = await post('/api/matches', { roomId, entryFee, maxPlayers, totalRounds, gameType });
     console.log(`[BackendClient] Created match ${result?.id} for room ${roomId}`);
     return result;
   } catch (err) {
@@ -125,7 +174,7 @@ async function finishMatch(matchId, winnerWallet, winnerId, draw) {
   }
 
   try {
-    const result = await post(`/api/matches/${matchId}/finish`, {
+    const result = await postFinish(`/api/matches/${matchId}/finish`, {
       matchId,
       winnerWallet: draw ? null : winnerWallet,
       winnerId:     draw ? null : winnerId,

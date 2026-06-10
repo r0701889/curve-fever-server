@@ -253,7 +253,7 @@ class Room {
 
     // Register match in backend (fire-and-forget)
     const walletList = [...this._players.values()].map(p => p.wallet);
-    BackendClient.createMatch(this.roomId, this.entryFee)
+    BackendClient.createMatch(this.roomId, this.entryFee, this._players.size, this.rounds, 'curve_fever')
       .then(match => {
         if (match?.id) {
           this._matchId = match.id;
