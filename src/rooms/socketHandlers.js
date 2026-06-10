@@ -1,19 +1,33 @@
 'use strict';
 
-const { RoomManager } = require('./RoomManager');
-const { VALID_ROUNDS, DEFAULT_ROUNDS } = require('../game/constants');
+const { RoomManager }  = require('./RoomManager');
+const { UserRegistry } = require('./UserRegistry');
+const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants');
 
 /**
  * ── Client → Server ───────────────────────────────────────────────────────────
  *
- *   createRoom   { wallet, username?, rounds?, entryFee? }
- *   joinRoom     { roomId, wallet, username? }
- *   setRounds    { rounds }                        host only, lobby only
- *   setReady     { ready }
- *   startGame    (no payload)                      host only
- *   playerInput  { direction }                     'left'|'right'|'neutral'
- *   playAgain    { roomId, wallet }                after matchEnded
- *   exitMatch    { roomId, wallet }                after matchEnded
+ *   registerUser   { wallet, username? }
+ *                  Must be called once after connect before using invite features.
+ *
+ *   createRoom     { wallet, username?, rounds?, entryFee? }
+ *   joinRoom       { roomId, wallet, username? }
+ *   setRounds      { rounds }                        host only, lobby only
+ *   setReady       { ready }
+ *   startGame      (no payload)                      host only
+ *   playerInput    { direction }                     'left'|'right'|'neutral'
+ *   playAgain      { roomId, wallet }                after matchEnded
+ *   exitMatch      { roomId, wallet }                after matchEnded
+ *
+ *   sendInvite     { targetWallet?, targetUsername?, roomId,
+ *                    fromWallet, fromUsername }
+ *                  Exactly one of targetWallet/targetUsername required.
+ *
+ *   acceptInvite   { roomId, wallet, username? }
+ *                  Same as joinRoom — joins the room.
+ *
+ *   declineInvite  { roomId, wallet, fromWallet }
+ *                  Notifies the inviter that the invite was declined.
  *
  * ── Server → Client ───────────────────────────────────────────────────────────
  *
@@ -23,7 +37,7 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS } = require('../game/constants');
  *                          winsRequired, currentRound, scoreboard, players }
  *   gameStarted          { roomId, rounds, winsRequired, scoreboard, players }
  *   roundStarted         { roomId, currentRound, rounds, winsRequired, scoreboard }
- *   gameState            { tick, players, trails, scoreboard, powerUps }  — 60×/sec
+ *   gameState            { tick, players, trails, scoreboard, powerUps } — 60×/sec
  *   playerDied           { socketId, wallet, reason }
  *   scoreboardUpdate     { scoreboard }
  *   roundEnded           { roomId, roundWinnerWallet, roundWinnerId, draw,
@@ -31,14 +45,22 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS } = require('../game/constants');
  *                          matchOver, nextRoundStartsAt, countdownSeconds }
  *   matchEnded           { roomId, winnerWallet, winnerId, draw,
  *                          scoreboard, totalRounds, rounds }
- *   rematchLobbyCreated  { roomId, lobbyState }    — broadcast to room when first
- *                                                     player clicks playAgain
- *   rematchJoined        { roomId, lobbyState }    — sent to joining player only
- *   lobbyFull            { message }               — sent when rematch lobby full
+ *   rematchLobbyCreated  { roomId, lobbyState }
+ *   rematchJoined        { roomId, lobbyState }
+ *   lobbyFull            { message }
  *   powerUpsUpdate       { powerUps }
  *   powerUpCollected     { socketId, playerWallet, playerUsername, type, duration }
  *   powerUpExpired       { socketId, playerWallet, type }
  *   powerUpUsed          { socketId, playerWallet, type }
+ *
+ *   inviteReceived       { roomId, fromWallet, fromUsername,
+ *                          targetWallet, targetUsername,
+ *                          entryFee, rounds, playersCount, maxPlayers }
+ *                          → sent to target socket only
+ *
+ *   inviteDeclined       { roomId, wallet }
+ *                          → sent to inviter socket only
+ *
  *   errorMessage         { message }
  *
  * ── Scoreboard format ────────────────────────────────────────────────────────
@@ -47,10 +69,25 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS } = require('../game/constants');
  *   activePowerUp: { type, remainingMs } | null
  */
 function registerSocketHandlers(io) {
-  const manager = new RoomManager(io);
+  const manager  = new RoomManager(io);
+  const registry = new UserRegistry();
 
   io.on('connection', (socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
+
+    // ── registerUser ───────────────────────────────────────────────────────────
+    // Payload: { wallet, username? }
+    // Must be called once after connecting to enable invite features.
+    socket.on('registerUser', (payload = {}) => {
+      const { wallet, username } = payload;
+
+      if (!isValidWallet(wallet)) {
+        return socket.emit('errorMessage', { message: 'registerUser: invalid wallet address' });
+      }
+
+      const sanitised = sanitizeUsername(username, wallet);
+      registry.register(socket.id, wallet, sanitised);
+    });
 
     // ── createRoom ─────────────────────────────────────────────────────────────
     socket.on('createRoom', (payload = {}) => {
@@ -133,8 +170,6 @@ function registerSocketHandlers(io) {
     });
 
     // ── playAgain ──────────────────────────────────────────────────────────────
-    // Payload: { roomId: string, wallet: string }
-    // Player wants to rematch after matchEnded.
     socket.on('playAgain', (payload = {}) => {
       const { roomId, wallet } = payload;
       console.log(`[Socket] playAgain — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
@@ -147,10 +182,8 @@ function registerSocketHandlers(io) {
       }
 
       const result = manager.playAgain(socket.id, wallet);
-
       if (!result.ok) {
         if (result.error === 'Lobby is full') {
-          // Use dedicated lobbyFull event as specified
           return socket.emit('lobbyFull', { message: 'Lobby is full' });
         }
         return socket.emit('errorMessage', { message: result.error });
@@ -158,32 +191,166 @@ function registerSocketHandlers(io) {
     });
 
     // ── exitMatch ──────────────────────────────────────────────────────────────
-    // Payload: { roomId: string, wallet: string }
-    // Player explicitly leaves the ended/rematch room.
     socket.on('exitMatch', (payload = {}) => {
-      const { roomId, wallet } = payload;
-      console.log(`[Socket] exitMatch — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
+      const { roomId } = payload;
+      console.log(`[Socket] exitMatch — socket: ${socket.id}, roomId: ${roomId}`);
 
       const result = manager.exitMatch(socket.id);
       if (!result.ok) {
         return socket.emit('errorMessage', { message: result.error ?? 'Could not exit room' });
       }
 
-      // Leave the Socket.io room channel
       if (roomId) socket.leave(roomId.toUpperCase());
+    });
+
+    // ── sendInvite ─────────────────────────────────────────────────────────────
+    // Payload: { targetWallet?, targetUsername?, roomId, fromWallet, fromUsername }
+    // Exactly one of targetWallet / targetUsername must be provided.
+    socket.on('sendInvite', (payload = {}) => {
+      const { targetWallet, targetUsername, roomId, fromWallet, fromUsername } = payload;
+
+      console.log(
+        `[Socket] sendInvite — from: ${fromWallet}, ` +
+        `target: ${targetWallet ?? targetUsername}, room: ${roomId}`
+      );
+
+      // ── Validate sender identity ─────────────────────────────────────────────
+      if (!isValidWallet(fromWallet)) {
+        return socket.emit('errorMessage', { message: 'sendInvite: invalid fromWallet' });
+      }
+
+      // ── Validate target was specified ────────────────────────────────────────
+      if (!targetWallet && !targetUsername) {
+        return socket.emit('errorMessage', {
+          message: 'sendInvite: provide targetWallet or targetUsername',
+        });
+      }
+
+      // ── Room must exist ──────────────────────────────────────────────────────
+      if (!roomId || typeof roomId !== 'string') {
+        return socket.emit('errorMessage', { message: 'sendInvite: invalid roomId' });
+      }
+      const room = manager.getRoom(roomId.toUpperCase());
+      if (!room) {
+        return socket.emit('errorMessage', { message: `Room ${roomId} not found` });
+      }
+
+      // ── Room must be in lobby state ──────────────────────────────────────────
+      if (room.state !== 'lobby') {
+        return socket.emit('errorMessage', { message: 'Match already started' });
+      }
+
+      // ── Room must not be full ────────────────────────────────────────────────
+      if (room.isFull) {
+        return socket.emit('errorMessage', { message: 'Room is full' });
+      }
+
+      // ── Sender must be in the room ───────────────────────────────────────────
+      const senderRoom = manager.getRoomForSocket(socket.id);
+      if (!senderRoom || senderRoom.roomId !== room.roomId) {
+        return socket.emit('errorMessage', { message: 'You are not in this room' });
+      }
+
+      // ── Resolve target ───────────────────────────────────────────────────────
+      const target = registry.findTarget(targetWallet, targetUsername);
+      if (!target) {
+        const identifier = targetWallet ?? targetUsername;
+        return socket.emit('errorMessage', { message: `User "${identifier}" is not online` });
+      }
+
+      // ── Cannot invite yourself ────────────────────────────────────────────────
+      if (target.wallet.toLowerCase() === fromWallet.toLowerCase()) {
+        return socket.emit('errorMessage', { message: 'Cannot invite yourself' });
+      }
+
+      // ── Emit invite to target ─────────────────────────────────────────────────
+      const lobbyState = room.getLobbyState();
+
+      io.to(target.socketId).emit('inviteReceived', {
+        roomId,
+        fromWallet,
+        fromUsername:   fromUsername ?? fromWallet,
+        targetWallet:   target.wallet,
+        targetUsername: target.username,
+        entryFee:       lobbyState.entryFee,
+        rounds:         lobbyState.rounds,
+        playersCount:   lobbyState.players.length,
+        maxPlayers:     MAX_PLAYERS,
+      });
+
+      console.log(
+        `[Socket] Invite sent: ${fromWallet} → ${target.wallet} for room ${roomId}`
+      );
+    });
+
+    // ── acceptInvite ───────────────────────────────────────────────────────────
+    // Payload: { roomId, wallet, username? }
+    // Identical logic to joinRoom — handled the same way server-side.
+    socket.on('acceptInvite', (payload = {}) => {
+      const { roomId, wallet, username } = payload;
+      console.log(`[Socket] acceptInvite — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
+
+      if (!isValidWallet(wallet)) {
+        return socket.emit('errorMessage', { message: 'Invalid wallet address' });
+      }
+      if (!roomId || typeof roomId !== 'string') {
+        return socket.emit('errorMessage', { message: 'Invalid room ID' });
+      }
+
+      const validatedUsername = sanitizeUsername(username, wallet);
+      const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
+
+      if (!result.ok) {
+        // Use lobbyFull for the capacity error, errorMessage for everything else
+        if (result.error === 'Room is full') {
+          return socket.emit('lobbyFull', { message: 'Lobby is full' });
+        }
+        return socket.emit('errorMessage', { message: result.error });
+      }
+
+      const { room } = result;
+      socket.join(room.roomId);
+      socket.emit('roomJoined', { roomId: room.roomId, lobbyState: room.getLobbyState() });
+      console.log(`[Socket] ${validatedUsername} (${wallet}) accepted invite → room ${room.roomId}`);
+    });
+
+    // ── declineInvite ──────────────────────────────────────────────────────────
+    // Payload: { roomId, wallet, fromWallet }
+    // Notifies the inviter that their invite was declined.
+    socket.on('declineInvite', (payload = {}) => {
+      const { roomId, wallet, fromWallet } = payload;
+      console.log(`[Socket] declineInvite — ${wallet} declined invite from ${fromWallet} for room ${roomId}`);
+
+      if (!isValidWallet(fromWallet)) {
+        return; // silently ignore malformed declines
+      }
+
+      // Find the inviter and notify them if still online
+      const inviter = registry.findByWallet(fromWallet);
+      if (inviter) {
+        io.to(inviter.socketId).emit('inviteDeclined', {
+          roomId,
+          wallet,   // wallet that declined
+        });
+      }
+      // No error if inviter is offline — decline is best-effort
     });
 
     // ── disconnect ─────────────────────────────────────────────────────────────
     socket.on('disconnect', (reason) => {
       console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
+      registry.remove(socket.id);
       manager.removePlayer(socket.id);
     });
   });
 
   // ── Periodic stats ─────────────────────────────────────────────────────────
   setInterval(() => {
-    if (manager.activeRoomCount > 0 || manager.connectedPlayers > 0) {
-      console.log(`[Stats] Rooms: ${manager.activeRoomCount} | Players: ${manager.connectedPlayers}`);
+    const rooms   = manager.activeRoomCount;
+    const players = manager.connectedPlayers;
+    const online  = registry.onlineCount;
+    if (rooms > 0 || players > 0 || online > 0) {
+      console.log(`[Stats] Rooms: ${rooms} | In-room: ${players} | Online: ${online}`);
     }
   }, 30_000);
 }
