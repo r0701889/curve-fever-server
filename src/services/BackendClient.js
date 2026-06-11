@@ -114,14 +114,38 @@ async function postFinish(path, body) {
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * Create a match in the backend when a game starts.
- * @param {string} roomId
- * @param {number} entryFee
+ * Create (or fetch, if already exists) a match record in the backend.
+ *
+ * IDEMPOTENT — safe to call multiple times with the same roomId.
+ * matchId is set to roomId by convention, so verify-payment can find the
+ * match immediately, even before startGame is called.
+ *
+ * @param {string} roomId       — Socket.io room code, also used as matchId
+ * @param {number} entryFeeUsdc
+ * @param {number} maxPlayers
+ * @param {number} rounds       — BO format (1,3,5,7,9)
+ * @param {string} gameType
+ * @param {string} [hostWallet] — informational only
+ * @returns {Promise<{ matchId, roomId, alreadyExists?: boolean } | null>}
  */
-async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, totalRounds = 1, gameType = 'curve_fever') {
+async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1, gameType = 'curve_fever', hostWallet = null) {
   try {
-    const result = await post('/api/matches', { roomId, entryFeeUsdc, maxPlayers, totalRounds, gameType });
-    console.log(`[BackendClient] Created match ${result?.id} for room ${roomId}`);
+    const result = await post('/api/matches', {
+      matchId:  roomId,
+      roomId,
+      entryFeeUsdc,
+      maxPlayers,
+      rounds,
+      gameType,
+      hostWallet,
+    });
+
+    if (result?.alreadyExists) {
+      console.log(`[BackendClient] Match ${result.matchId} already existed for room ${roomId}`);
+    } else {
+      console.log(`[BackendClient] Created match ${result?.matchId} for room ${roomId}`);
+    }
+
     return result;
   } catch (err) {
     console.error(`[BackendClient] createMatch failed: ${err.message}`);

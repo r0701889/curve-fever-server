@@ -86,7 +86,22 @@ class Room {
 
     this._addPlayer(hostId, hostWallet, hostUsername);
 
-    console.log(`[Room ${this.roomId}] Created — BO${this.rounds} (need ${this.winsRequired} wins)`);
+    // ── Register match with backend immediately ──────────────────────────────
+    // matchId = roomId by convention. This is set SYNCHRONOUSLY so that
+    // verify-payment can be called by players in the lobby — before startGame.
+    // The actual backend POST is fire-and-forget (idempotent — safe to retry
+    // and safe if it arrives after a verify-payment call due to network timing,
+    // since the backend's INSERT OR IGNORE means the row will exist by the
+    // time verify-payment's SELECT runs in practice, and if a race does occur
+    // the backend returns 404 which the frontend can retry).
+    this._matchId = roomId;
+
+    BackendClient.createMatch(this.roomId, this.entryFee, MAX_PLAYERS, this.rounds, 'curve_fever', hostWallet)
+      .catch(err => {
+        console.error(`[Room ${this.roomId}] Backend match registration error: ${err.message}`);
+      });
+
+    console.log(`[Room ${this.roomId}] Created — BO${this.rounds} (need ${this.winsRequired} wins) — matchId: ${this._matchId}`);
   }
 
   // ─── Player registration ──────────────────────────────────────────────────────
@@ -251,19 +266,14 @@ class Room {
       })),
     });
 
-    // Register match in backend (fire-and-forget)
+    // Match record was already created when the room was created (constructor).
+    // _matchId === this.roomId by convention — already set.
+    // Register players (idempotent — INSERT OR IGNORE) and mark match as started.
     const walletList = [...this._players.values()].map(p => p.wallet);
-    BackendClient.createMatch(this.roomId, this.entryFee, this._players.size, this.rounds, 'curve_fever')
-      .then(match => {
-        if (match?.id) {
-          this._matchId = match.id;
-          console.log(`[Room ${this.roomId}] Backend match ID: ${this._matchId}`);
-          return BackendClient.registerPlayers(this._matchId, walletList)
-            .then(() => BackendClient.startMatch(this._matchId));
-        }
-      })
+    BackendClient.registerPlayers(this._matchId, walletList)
+      .then(() => BackendClient.startMatch(this._matchId))
       .catch(err => {
-        console.error(`[Room ${this.roomId}] Backend registration error: ${err.message}`);
+        console.error(`[Room ${this.roomId}] Backend start registration error: ${err.message}`);
       });
 
     this._startRound();
@@ -498,8 +508,16 @@ class Room {
 
     this.state        = 'lobby';
     this.currentRound = 0;
-    this._matchId     = null;
     this.hostId       = socketId;
+
+    // _matchId stays === this.roomId (matchId/roomId are the same value by
+    // convention and never change for the lifetime of this Room object).
+    //
+    // NOTE: the backend match record for this matchId now has status='finished'
+    // from the previous match. verify-payment on the rematch will currently
+    // fail with WRONG_STATUS until the backend supports re-opening a finished
+    // match for a new round of payments. This is a known follow-up — out of
+    // scope for the room-creation registration fix.
 
     // Re-add the first player
     this._addPlayer(socketId, wallet, username);
