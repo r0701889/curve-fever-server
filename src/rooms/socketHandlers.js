@@ -34,8 +34,24 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *   roomCreated          { roomId, lobbyState }
  *   roomJoined           { roomId, lobbyState }
  *   lobbyState           { roomId, hostId, state, entryFee, matchId, rounds,
- *                          winsRequired, currentRound, scoreboard, players }
+ *                          winsRequired, currentRound, gameStartAt,
+ *                          countdownSeconds, scoreboard, players }
+ *                          state is one of: 'lobby' | 'starting' | 'playing' |
+ *                          'between_rounds' | 'ended'
+ *
+ *   gameStarting         { roomId, gameStartAt, countdownSeconds, players, scoreboard }
+ *                          Sent when the host starts the game. The server enters
+ *                          a 5-second synchronized countdown before gameStarted.
+ *                          gameStartAt is a unix-ms timestamp (Date.now() + 5000) —
+ *                          use this for a synced client-side countdown display.
+ *                          No new players may join while state === 'starting'.
+ *                          If the room becomes invalid during the countdown
+ *                          (too few players), the start is cancelled: the server
+ *                          emits errorMessage and lobbyState (state back to 'lobby').
+ *
  *   gameStarted          { roomId, rounds, winsRequired, scoreboard, players }
+ *                          Sent exactly gameStartAt (5s after gameStarting).
+ *                          The game loop begins only after this event.
  *   roundStarted         { roomId, currentRound, rounds, winsRequired, scoreboard }
  *   gameState            { tick, players, trails, scoreboard, powerUps } — 60×/sec
  *   playerDied           { socketId, wallet, reason }

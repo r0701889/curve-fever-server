@@ -9,6 +9,7 @@ const {
   DEFAULT_ROUNDS,
   BETWEEN_ROUNDS_DELAY_MS,
   POST_MATCH_GRACE_MS,
+  PRE_GAME_COUNTDOWN_MS,
   PLAYER_COLORS,
 } = require('../game/constants');
 
@@ -17,7 +18,16 @@ const {
  *
  * ── Lifecycle ────────────────────────────────────────────────────────────────
  *
- *  lobby → playing → between_rounds → ... → ended → (rematch lobby) → ...
+ *  lobby → starting → playing → between_rounds → ... → ended → (rematch lobby) → ...
+ *
+ *  'starting' is a 5-second synchronized pre-game countdown:
+ *    - host calls startGame() → validated → state becomes 'starting'
+ *    - gameStarting is broadcast with gameStartAt (Date.now() + 5000)
+ *    - no one may join during 'starting'
+ *    - after exactly PRE_GAME_COUNTDOWN_MS, gameStarted is broadcast and the
+ *      game loop begins (_startRound)
+ *    - if the room becomes invalid during the countdown (too few players),
+ *      the start is cancelled and the room returns to 'lobby'
  *
  *  After matchEnded the room enters 'ended' state and stays alive for
  *  POST_MATCH_GRACE_MS (60 s).  During that window players may:
@@ -80,6 +90,11 @@ class Room {
     this._matchId        = null;
     this._countdownTimer = null;
     this._graceTimer     = null;
+    this._preGameTimer   = null;
+
+    // Set when state becomes 'starting' — unix ms timestamp of game start.
+    // Cleared (null) when not in the 'starting' state.
+    this.gameStartAt = null;
 
     // Set of wallet addresses eligible to join rematch — populated at matchEnded
     this._eligibleWallets = new Set();
@@ -161,14 +176,19 @@ class Room {
 
   getLobbyState() {
     return {
-      roomId:       this.roomId,
-      hostId:       this.hostId,
-      state:        this.state,
-      entryFee:     this.entryFee,
-      matchId:      this._matchId,
-      rounds:       this.rounds,
-      winsRequired: this.winsRequired,
-      currentRound: this.currentRound,
+      roomId:           this.roomId,
+      hostId:           this.hostId,
+      state:            this.state,
+      entryFee:         this.entryFee,
+      matchId:          this._matchId,
+      rounds:           this.rounds,
+      winsRequired:     this.winsRequired,
+      currentRound:     this.currentRound,
+      // Pre-game countdown — only set while state === 'starting'
+      gameStartAt:      this.gameStartAt,
+      countdownSeconds: this.gameStartAt
+        ? Math.max(0, Math.ceil((this.gameStartAt - Date.now()) / 1000))
+        : null,
       scoreboard:   this._buildScoreboard(),
       players: [...this._players.values()].map(p => ({
         socketId: p.socketId,
@@ -183,6 +203,8 @@ class Room {
   // ─── Lobby actions ────────────────────────────────────────────────────────────
 
   join(socketId, wallet, username) {
+    // 'starting' = pre-game countdown in progress — no new players allowed
+    if (this.state === 'starting')   return { ok: false, error: 'Game is starting — cannot join now' };
     if (this.state !== 'lobby')      return { ok: false, error: 'Game already in progress' };
     if (this.isFull)                 return { ok: false, error: 'Room is full' };
     if (this._players.has(socketId)) return { ok: false, error: 'Already in room' };
@@ -223,9 +245,23 @@ class Room {
 
   // ─── Start match ─────────────────────────────────────────────────────────────
 
+  /**
+   * Host requests the game to start.
+   *
+   * Does NOT start the game immediately. Validates everything, then enters
+   * a 5-second synchronized 'starting' countdown. The actual game start
+   * (_actuallyStartGame) happens server-side after PRE_GAME_COUNTDOWN_MS,
+   * regardless of what the frontend does — the server is the sole authority
+   * on when the game begins.
+   */
   startGame(requesterId) {
     if (requesterId !== this.hostId) {
       this._emitToSocket(requesterId, 'errorMessage', { message: 'Only the host can start the game' });
+      return;
+    }
+    // 'starting' state: a countdown is already in progress — ignore duplicate calls
+    if (this.state === 'starting') {
+      this._emitToSocket(requesterId, 'errorMessage', { message: 'Game is already starting' });
       return;
     }
     if (this.state !== 'lobby') {
@@ -245,7 +281,64 @@ class Room {
       return;
     }
 
-    this.state = 'playing';
+    // ── All validation passed — enter the 'starting' countdown ────────────────
+    this.state       = 'starting';
+    this.gameStartAt = Date.now() + PRE_GAME_COUNTDOWN_MS;
+
+    console.log(
+      `[Room ${this.roomId}] ── gameStarting — countdown ${PRE_GAME_COUNTDOWN_MS / 1000}s, ` +
+      `gameStartAt: ${this.gameStartAt}`
+    );
+
+    this._emitToRoom('gameStarting', {
+      roomId:           this.roomId,
+      gameStartAt:      this.gameStartAt,
+      countdownSeconds: PRE_GAME_COUNTDOWN_MS / 1000,
+      players: [...this._players.values()].map(p => ({
+        socketId: p.socketId,
+        wallet:   p.wallet,
+        username: this._usernames.get(p.socketId),
+        color:    this._colors.get(p.socketId),
+      })),
+      scoreboard: this._buildScoreboard(),
+    });
+
+    this._preGameTimer = setTimeout(() => {
+      this._preGameTimer = null;
+      this._actuallyStartGame();
+    }, PRE_GAME_COUNTDOWN_MS);
+  }
+
+  /**
+   * Called exactly PRE_GAME_COUNTDOWN_MS after gameStarting was broadcast.
+   *
+   * Re-validates the room is still viable (players may have disconnected
+   * during the countdown). If not viable, cancels the start and returns the
+   * room to 'lobby'. Otherwise proceeds with the existing gameStarted flow
+   * and begins the game loop.
+   */
+  _actuallyStartGame() {
+    // ── Safety re-check: room may have become invalid during the countdown ────
+    if (this.state !== 'starting') {
+      // Room was already moved out of 'starting' by some other path
+      // (e.g. removePlayer cancelled the countdown) — nothing to do.
+      return;
+    }
+
+    if (!this.hasMinPlayers) {
+      console.warn(`[Room ${this.roomId}] Countdown finished but room no longer has enough players — cancelling start`);
+      this.state       = 'lobby';
+      this.gameStartAt = null;
+      this._emitToRoom('errorMessage', { message: 'Not enough players — game start cancelled' });
+      this._emitToRoom('lobbyState', this.getLobbyState());
+      return;
+    }
+
+    // Host may have disconnected during the countdown — host migration already
+    // handles this in removePlayer, so this.hostId is guaranteed valid here.
+
+    this.state       = 'playing';
+    this.gameStartAt = null;
 
     // Reset scoreboard wins for new match
     for (const socketId of this._players.keys()) {
@@ -509,6 +602,8 @@ class Room {
     this.state        = 'lobby';
     this.currentRound = 0;
     this.hostId       = socketId;
+    this.gameStartAt  = null;
+    this._cancelPreGameTimer();
 
     // _matchId stays === this.roomId (matchId/roomId are the same value by
     // convention and never change for the lifetime of this Room object).
@@ -589,6 +684,39 @@ class Room {
         this.hostId = [...this._players.keys()][0];
         console.log(`[Room ${this.roomId}] Host migrated to ${this.hostId}`);
       }
+      this._emitToRoom('lobbyState', this.getLobbyState());
+      return;
+    }
+
+    // ── 'starting': pre-game countdown in progress ──────────────────────────
+    if (this.state === 'starting') {
+      if (this._players.size === 0) {
+        // Everyone left — cancel countdown and clean up
+        this._cancelPreGameTimer();
+        this.gameStartAt = null;
+        this._onEmpty();
+        return;
+      }
+
+      // Migrate host if needed
+      if (socketId === this.hostId) {
+        this.hostId = [...this._players.keys()][0];
+        console.log(`[Room ${this.roomId}] Host migrated to ${this.hostId}`);
+      }
+
+      if (this._players.size < MIN_PLAYERS) {
+        // Not enough players to proceed — cancel the countdown, return to lobby
+        console.warn(`[Room ${this.roomId}] Player left during countdown — not enough players, cancelling start`);
+        this._cancelPreGameTimer();
+        this.state       = 'lobby';
+        this.gameStartAt = null;
+        this._emitToRoom('errorMessage', { message: 'Not enough players — game start cancelled' });
+        this._emitToRoom('lobbyState', this.getLobbyState());
+        return;
+      }
+
+      // Still enough players — countdown continues unaffected.
+      // Broadcast updated player list/scoreboard so clients can update the UI.
       this._emitToRoom('lobbyState', this.getLobbyState());
       return;
     }
@@ -674,6 +802,14 @@ class Room {
     if (this._countdownTimer) {
       clearTimeout(this._countdownTimer);
       this._countdownTimer = null;
+    }
+    this._cancelPreGameTimer();
+  }
+
+  _cancelPreGameTimer() {
+    if (this._preGameTimer) {
+      clearTimeout(this._preGameTimer);
+      this._preGameTimer = null;
     }
   }
 }

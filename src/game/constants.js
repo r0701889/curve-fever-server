@@ -34,6 +34,7 @@ const VALID_ROUNDS             = [1, 3, 5, 7, 9];
 const DEFAULT_ROUNDS           = 1;
 const BETWEEN_ROUNDS_DELAY_MS  = 10000;
 const POST_MATCH_GRACE_MS      = 60_000; // keep room alive 60s after matchEnded for rematch
+const PRE_GAME_COUNTDOWN_MS    = 5000;   // synchronized countdown before gameStarted
 
 // ─── Spawn ────────────────────────────────────────────────────────────────────
 
@@ -113,6 +114,7 @@ module.exports = {
   DEFAULT_ROUNDS,
   BETWEEN_ROUNDS_DELAY_MS,
   POST_MATCH_GRACE_MS,
+  PRE_GAME_COUNTDOWN_MS,
   SPAWN_MARGIN,
   PLAYER_COLORS,
   // power-ups
