@@ -39,6 +39,20 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *                          state is one of: 'lobby' | 'starting' | 'playing' |
  *                          'between_rounds' | 'ended'
  *
+ *                          players[]: { socketId, wallet, username, ready, color }
+ *                          color is assigned the moment a player creates/joins
+ *                          the room — present in roomCreated.lobbyState,
+ *                          roomJoined.lobbyState, and every lobbyState update.
+ *                          It is the SAME color used later in gameStarting,
+ *                          gameStarted, gameState, scoreboard, roundEnded and
+ *                          matchEnded — never reassigned once given. Colors are
+ *                          drawn from a fixed 6-color palette (max 6 players)
+ *                          with no duplicates in a room. If a player leaves
+ *                          before the game starts, their color is freed for
+ *                          others; if they reconnect with the same wallet
+ *                          before the game starts and that color is still
+ *                          free, they get it back.
+ *
  *   gameStarting         { roomId, gameStartAt, countdownSeconds, players, scoreboard }
  *                          Sent when the host starts the game. The server enters
  *                          a 5-second synchronized countdown before gameStarted.

@@ -82,9 +82,15 @@ class Room {
 
     // Scoreboard state — all Maps keyed by socketId
     this._usernames = new Map();
-    this._colors    = new Map();
+    this._colors    = new Map();   // socketId → color (assigned at join, stable for the session)
     this._wins      = new Map();
     this._alive     = new Map();
+
+    // wallet → color — lets a reconnecting wallet (new socketId) recover its
+    // previous color before the game starts. Best-effort: if that color has
+    // since been taken by another player, the reconnecting wallet gets the
+    // next available color instead.
+    this._walletColors = new Map();
 
     this._gameLoop       = null;
     this._matchId        = null;
@@ -124,14 +130,63 @@ class Room {
   _addPlayer(socketId, wallet, username) {
     this._players.set(socketId, { socketId, wallet, ready: false });
 
-    if (!this._colors.has(socketId)) {
-      this._colors.set(socketId, PLAYER_COLORS[this._colors.size % PLAYER_COLORS.length]);
-    }
+    this._assignColor(socketId, wallet);
+
     if (!this._usernames.has(socketId)) {
       this._usernames.set(socketId, username || wallet);
     }
     if (!this._wins.has(socketId)) this._wins.set(socketId, 0);
     if (!this._alive.has(socketId)) this._alive.set(socketId, true);
+  }
+
+  /**
+   * Assign a stable color to a player when they join.
+   *
+   * Color rules:
+   *   - Each socketId keeps its color for the lifetime of that connection —
+   *     never reassigned later (not at game start, not mid-match).
+   *   - No two players in the same room ever hold the same color at once
+   *     (palette has exactly MAX_PLAYERS=6 colors).
+   *   - If this socketId already has a color (e.g. _addPlayer called again
+   *     idempotently), do nothing.
+   *   - If this wallet previously held a color (reconnect with a new socketId
+   *     before the game started) AND that color is currently free, reuse it.
+   *   - Otherwise, assign the first color in PLAYER_COLORS not currently held
+   *     by any connected socketId.
+   */
+  _assignColor(socketId, wallet) {
+    // Already has a color — never reassign (covers idempotent _addPlayer calls
+    // and "do not reassign at game start")
+    if (this._colors.has(socketId)) return this._colors.get(socketId);
+
+    const inUse = new Set(this._colors.values());
+
+    // Try to preserve this wallet's previous color if it's free
+    const previousColor = this._walletColors.get(wallet);
+    if (previousColor && !inUse.has(previousColor)) {
+      this._colors.set(socketId, previousColor);
+      this._walletColors.set(wallet, previousColor);
+      return previousColor;
+    }
+
+    // Otherwise pick the first unused color in the palette
+    const color = PLAYER_COLORS.find(c => !inUse.has(c)) ?? PLAYER_COLORS[0];
+    this._colors.set(socketId, color);
+    this._walletColors.set(wallet, color);
+    return color;
+  }
+
+  /**
+   * Free a socket's color so it becomes available to other players.
+   * Only call this for players leaving BEFORE the game starts (lobby/starting).
+   * Never call during an active match — colors must not change mid-match.
+   *
+   * _walletColors is intentionally left untouched so the same wallet can
+   * recover this color via _assignColor if they reconnect before the color
+   * is claimed by someone else.
+   */
+  _releaseColor(socketId) {
+    this._colors.delete(socketId);
   }
 
   // ─── Scoreboard ───────────────────────────────────────────────────────────────
@@ -590,14 +645,22 @@ class Room {
    * - Clears matchId (new one comes from backend when next game starts)
    * - Sets host to the requesting player (or first remaining if host left)
    * - Keeps same format (rounds, entryFee)
+   *
+   * Colors: _colors is cleared so the rematch lobby re-assigns colors via
+   * _assignColor. Because _walletColors is kept intact, any player whose
+   * socket is still connected (the common case — playAgain reuses the same
+   * socket) will recover their previous color automatically the moment
+   * _addPlayer runs for them again (here for the first player, and in
+   * playAgain's 'lobby' branch for subsequent players). _usernames is kept
+   * intact too (stable across rematches).
    */
   _resetForRematch(socketId, wallet) {
-    // Keep username/color maps intact (stable across rematches)
     const username = this._usernames.get(socketId) ?? wallet;
 
     this._players.clear();
     this._wins.clear();
     this._alive.clear();
+    this._colors.clear();
 
     this.state        = 'lobby';
     this.currentRound = 0;
@@ -633,6 +696,10 @@ class Room {
     const player = this._players.get(socketId);
     this._players.delete(socketId);
     this._releaseSocket(socketId);
+
+    // exitMatch only runs in 'ended' or 'lobby' (rematch) states — never
+    // during an active match — so it's always safe to free the color.
+    this._releaseColor(socketId);
 
     console.log(`[Room ${this.roomId}] ${player.wallet} exited`);
 
@@ -676,6 +743,11 @@ class Room {
     this._releaseSocket(socketId);
 
     if (this.state === 'lobby') {
+      // Free this socket's color — it becomes available to other players.
+      // _walletColors keeps the mapping so this wallet can recover the same
+      // color if it reconnects before the game starts.
+      this._releaseColor(socketId);
+
       if (this._players.size === 0) {
         this._onEmpty();
         return;
@@ -690,6 +762,9 @@ class Room {
 
     // ── 'starting': pre-game countdown in progress ──────────────────────────
     if (this.state === 'starting') {
+      // Free this socket's color — same reasoning as the 'lobby' branch above.
+      this._releaseColor(socketId);
+
       if (this._players.size === 0) {
         // Everyone left — cancel countdown and clean up
         this._cancelPreGameTimer();
