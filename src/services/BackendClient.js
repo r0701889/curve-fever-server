@@ -111,6 +111,30 @@ async function postFinish(path, body) {
   return response.json();
 }
 
+// ─── Retry helper ────────────────────────────────────────────────────────────
+
+/**
+ * Retry an async operation up to `attempts` times with linear backoff.
+ * Used for createMatch — the most important call to get right, since a
+ * failure here means Emblem will eventually get a 404 from GET /matches/:id
+ * with no obvious cause (the match plays out fine on the game server, but
+ * its result is never queryable).
+ */
+async function _withRetries(fn, { attempts = 3, delayMs = 500 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
@@ -129,26 +153,32 @@ async function postFinish(path, body) {
  * @returns {Promise<{ matchId, roomId, alreadyExists?: boolean } | null>}
  */
 async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1, gameType = 'curve_fever', hostWallet = null) {
+  const body = {
+    matchId:  roomId,
+    roomId,
+    entryFeeUsdc,
+    maxPlayers,
+    rounds,
+    gameType,
+    hostWallet,
+    players: [], // see POST /api/matches docs — accepted, players registered separately
+  };
+
   try {
-    const result = await post('/api/matches', {
-      matchId:  roomId,
-      roomId,
-      entryFeeUsdc,
-      maxPlayers,
-      rounds,
-      gameType,
-      hostWallet,
-    });
+    // Retried — this is the persistence point Emblem's GET /matches/:id depends on.
+    // A single transient failure here (cold start, brief network blip) must not
+    // silently leave the match unqueryable for the rest of its lifetime.
+    const result = await _withRetries(() => post('/api/matches', body), { attempts: 3, delayMs: 500 });
 
     if (result?.alreadyExists) {
-      console.log(`[BackendClient] Match ${result.matchId} already existed for room ${roomId}`);
+      console.log(`[BackendClient] [match_registered] matchId=${result.matchId} roomId=${roomId} alreadyExists=true`);
     } else {
-      console.log(`[BackendClient] Created match ${result?.matchId} for room ${roomId}`);
+      console.log(`[BackendClient] [match_registered] matchId=${result?.matchId} roomId=${roomId}`);
     }
 
     return result;
   } catch (err) {
-    console.error(`[BackendClient] createMatch failed: ${err.message}`);
+    console.error(`[BackendClient] [match_register_failed] roomId=${roomId} error=${err.message}`);
     return null;
   }
 }
@@ -191,24 +221,63 @@ async function startMatch(matchId) {
  * @param {string|null} winnerId
  * @param {boolean} draw
  */
-async function finishMatch(matchId, winnerWallet, winnerId, draw) {
+/**
+ * Report match result to the backend.
+ * This is the AUTHORITATIVE call — it persists the result so Emblem's
+ * GET /matches/:id (with SERVER_SECRET) returns it after the room is destroyed.
+ *
+ * Extra context fields (roomId, players, entryFeeUsdc, maxPlayers, totalRounds)
+ * are sent so the backend can self-heal the match record if it was never
+ * created at room-creation time (defensive — should be a no-op normally).
+ *
+ * @param {string} matchId
+ * @param {string|null} winnerWallet
+ * @param {string|null} winnerId
+ * @param {boolean} draw
+ * @param {object} [context]
+ * @param {string}   [context.roomId]
+ * @param {string[]} [context.players]      - wallet addresses in this match
+ * @param {number}   [context.entryFeeUsdc]
+ * @param {number}   [context.maxPlayers]
+ * @param {number}   [context.totalRounds]
+ */
+async function finishMatch(matchId, winnerWallet, winnerId, draw, context = {}) {
   if (!matchId) {
     console.warn('[BackendClient] finishMatch called without matchId — skipping');
     return null;
   }
 
+  const body = {
+    matchId,
+    winnerWallet: draw ? null : winnerWallet,
+    winnerId:     draw ? null : winnerId,
+    draw:         Boolean(draw),
+    roomId:        context.roomId,
+    players:       context.players,
+    entryFeeUsdc:  context.entryFeeUsdc,
+    maxPlayers:    context.maxPlayers,
+    totalRounds:   context.totalRounds,
+  };
+
+  console.log(
+    `[BackendClient] [match_finish_sent_to_backend] matchId=${matchId} ` +
+    `${draw ? 'draw=true' : `winnerWallet=${winnerWallet}`}`
+  );
+
   try {
-    const result = await postFinish(`/api/matches/${matchId}/finish`, {
-      matchId,
-      winnerWallet: draw ? null : winnerWallet,
-      winnerId:     draw ? null : winnerId,
-      draw:         Boolean(draw),
-    });
-    console.log(`[BackendClient] Match ${matchId} finished — ${draw ? 'draw' : `winner: ${winnerWallet}`}`);
+    const result = await postFinish(`/api/matches/${matchId}/finish`, body);
+    console.log(
+      `[BackendClient] [match_finish_backend_success] matchId=${matchId} ` +
+      `payoutStatus=${result?.payoutStatus} prizePoolUsdc=${result?.prizePoolUsdc}` +
+      (result?.selfHealed ? ' selfHealed=true' : '')
+    );
     return result;
   } catch (err) {
-    // Log but don't crash the game server — match result is already broadcast to clients
-    console.error(`[BackendClient] finishMatch failed for ${matchId}: ${err.message}`);
+    // Log but don't crash the game server — match result is already broadcast to clients.
+    // This is the critical failure mode: the match finished on the game server,
+    // but Emblem's GET /matches/:id will 404 or return a stale status until
+    // this is investigated (check BACKEND_URL / RAILWAY_INTERNAL_TOKEN).
+    console.error(`[BackendClient] [match_finish_backend_failed] matchId=${matchId} error=${err.message}`);
     return null;
   }
 }

@@ -561,10 +561,19 @@ class Room {
     });
 
     if (this._matchId) {
-      BackendClient.finishMatch(this._matchId, winnerWallet, winnerId, isDraw)
-        .catch(err => {
-          console.error(`[Room ${this.roomId}] Backend finishMatch error: ${err.message}`);
-        });
+      // Pass extra context so the backend can self-heal the match record if it
+      // was never created at room-creation time (defensive — normally a no-op
+      // since createMatch already ran in the constructor).
+      const walletList = [...this._players.values()].map(p => p.wallet);
+      BackendClient.finishMatch(this._matchId, winnerWallet, winnerId, isDraw, {
+        roomId:       this.roomId,
+        players:      walletList,
+        entryFeeUsdc: this.entryFee,
+        maxPlayers:   MAX_PLAYERS,
+        totalRounds:  this.rounds,
+      }).catch(err => {
+        console.error(`[Room ${this.roomId}] [match_finish_backend_failed] ${err.message}`);
+      });
     } else {
       console.warn(`[Room ${this.roomId}] matchEnded but no matchId — backend not notified`);
     }
