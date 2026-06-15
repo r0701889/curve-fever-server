@@ -2,8 +2,6 @@
 
 const { v4: uuidv4 } = require('uuid');
 const {
-  ARENA_WIDTH,
-  ARENA_HEIGHT,
   POWERUP_SPAWN_MIN_MS,
   POWERUP_SPAWN_MAX_MS,
   POWERUP_MAX_ON_MAP,
@@ -12,46 +10,66 @@ const {
   POWERUP_TYPES,
   POWERUP_DURATION_MS,
   POWERUP_WEIGHTS,
+  NITRO_SPEED_MULTIPLIER,
+  SPEED_BOOST_MULTIPLIER,
+  FAT_TRAIL_RADIUS_MULTIPLIER,
+  TINY_TRAIL_RADIUS_MULTIPLIER,
   POWERUP_SPAWN_WALL_MARGIN,
   POWERUP_SPAWN_TRAIL_CLEARANCE,
+  POWERUP_SPAWN_PLAYER_CLEARANCE,
 } = require('./constants');
 
-// Total weight for weighted random selection
 const TOTAL_WEIGHT = POWERUP_WEIGHTS.reduce((s, e) => s + e.weight, 0);
 
 /**
  * PowerUpManager
  *
- * Completely server-authoritative. Owns:
- *   - Map power-up spawn / expire lifecycle
- *   - Per-player active power-up state
+ * Server-authoritative. Owns:
+ *   - Map power-up spawn / expire lifecycle (within ArenaManager.current bounds)
+ *   - Per-player ACTIVE power-ups (a player can have multiple at once)
  *   - Collection detection (called each tick by GameLoop)
  *   - Effect queries (GameLoop asks "what speed multiplier does player X have?")
+ *
+ * Multi-concurrent semantics:
+ *   - Speed modifiers (NITRO, SPEED_BOOST) are mutually exclusive — latest wins.
+ *   - Trail-radius modifiers (FAT_TRAIL, TINY_TRAIL) are mutually exclusive — latest wins.
+ *   - GHOST stacks alongside any of the above (you can be Ghost + Nitro).
+ *   - SHIELD and LENGTH_BOOST do NOT live here — they modify growth directly.
+ *     PowerUpManager just emits the "collected" event for them.
  *
  * Does NOT know about Socket.io — uses callbacks for output.
  *
  * Callbacks:
- *   onPowerUpsUpdate(powerUps)          — map changed (spawn/collect/expire)
- *   onPowerUpCollected(socketId, entry) — player picked up a power-up
- *   onPowerUpExpired(socketId, type)    — active power-up timer ran out
- *   onPowerUpUsed(socketId, type)       — shield consumed on trail hit
+ *   onPowerUpsUpdate(powerUps)             — map changed (spawn/collect/expire)
+ *   onPowerUpCollected(socketId, type, ms) — player picked up a power-up
+ *   onPowerUpExpired(socketId, type)       — active power-up timer ran out
+ *   onPowerUpUsed(socketId, type)          — shield consumed on trail hit (legacy — kept for compat)
+ *
+ * Dependencies:
+ *   arena   — ArenaManager (for spawn bounds)
+ *   growth  — Map<socketId, growthData> (for player-clearance check during spawn)
  */
 class PowerUpManager {
-  constructor({ onPowerUpsUpdate, onPowerUpCollected, onPowerUpExpired, onPowerUpUsed }) {
-    this._onPowerUpsUpdate  = onPowerUpsUpdate;
+  constructor({ onPowerUpsUpdate, onPowerUpCollected, onPowerUpExpired, onPowerUpUsed, arena, growth }) {
+    this._onPowerUpsUpdate   = onPowerUpsUpdate;
     this._onPowerUpCollected = onPowerUpCollected;
-    this._onPowerUpExpired  = onPowerUpExpired;
-    this._onPowerUpUsed     = onPowerUpUsed;
+    this._onPowerUpExpired   = onPowerUpExpired;
+    this._onPowerUpUsed      = onPowerUpUsed;
+    this._arena              = arena ?? null;
+    this._growth             = growth ?? null;
 
     // Power-ups currently on the map: id → { id, type, x, y, spawnedAt, expiresAt }
     this._mapPowerUps = new Map();
 
-    // Active power-ups per player: socketId → { type, activatedAt, expiresAt|null }
-    this._playerPowerUps = new Map();
+    // Active power-ups per player: socketId → Map<type, { type, activatedAt, expiresAt }>
+    // Using a per-player Map keyed by type lets us cleanly enforce "latest wins
+    // within a category" while permitting cross-category stacking.
+    this._playerActive = new Map();
 
-    // Next spawn timer
-    this._spawnTimer = null;
-    this._running    = false;
+    this._spawnTimer    = null;
+    this._running       = false;
+    this._currentTrails = null;
+    this._currentPlayers = null;
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -69,30 +87,22 @@ class PowerUpManager {
     }
   }
 
-  /** Clear everything — called at round start/end */
   reset() {
     this.stop();
     this._mapPowerUps.clear();
-    this._playerPowerUps.clear();
+    this._playerActive.clear();
   }
 
-  // ─── Tick — called every GameLoop tick ───────────────────────────────────────
+  // ─── Tick ────────────────────────────────────────────────────────────────────
 
-  /**
-   * Main tick:
-   *   1. Expire map power-ups whose lifetime has elapsed
-   *   2. Expire active player power-ups whose duration has elapsed
-   *   3. Check collection for each alive player
-   *
-   * @param {Map<string,{x,y,alive}>} players  socketId → player state from GameLoop
-   */
   tick(players) {
     if (!this._running) return;
+    this._currentPlayers = players;
 
     const now = Date.now();
     let mapChanged = false;
 
-    // ── 1. Expire map power-ups ────────────────────────────────────────────────
+    // 1. Expire map power-ups
     for (const [id, pu] of this._mapPowerUps) {
       if (now >= pu.expiresAt) {
         this._mapPowerUps.delete(id);
@@ -101,119 +111,177 @@ class PowerUpManager {
       }
     }
 
-    // ── 2. Expire active player power-ups ─────────────────────────────────────
-    for (const [socketId, active] of this._playerPowerUps) {
-      if (active.expiresAt !== null && now >= active.expiresAt) {
-        const { type } = active;
-        this._playerPowerUps.delete(socketId);
-        console.log(`[PowerUp] ${socketId} power-up ${type} expired`);
-        this._onPowerUpExpired(socketId, type);
+    // 2. Expire active player power-ups (per-type)
+    for (const [socketId, typesMap] of this._playerActive) {
+      for (const [type, active] of typesMap) {
+        if (active.expiresAt !== null && now >= active.expiresAt) {
+          typesMap.delete(type);
+          console.log(`[PowerUp] ${socketId} power-up ${type} expired`);
+          this._onPowerUpExpired(socketId, type);
+        }
       }
+      if (typesMap.size === 0) this._playerActive.delete(socketId);
     }
 
-    // ── 3. Collection detection ────────────────────────────────────────────────
+    // 3. Collection detection
     if (this._mapPowerUps.size > 0) {
       for (const [socketId, player] of players) {
         if (!player.alive) continue;
-
         for (const [puId, pu] of this._mapPowerUps) {
           const dx = player.x - pu.x;
           const dy = player.y - pu.y;
           if (dx * dx + dy * dy < POWERUP_COLLECT_RADIUS * POWERUP_COLLECT_RADIUS) {
             this._collect(socketId, puId, pu);
             mapChanged = true;
-            break; // one collection per player per tick
+            break;
           }
         }
       }
     }
 
-    if (mapChanged) {
-      this._emitMapUpdate();
-    }
+    if (mapChanged) this._emitMapUpdate();
   }
 
-  // ─── Collection ───────────────────────────────────────────────────────────────
+  // ─── Collection ──────────────────────────────────────────────────────────────
 
   _collect(socketId, puId, pu) {
     this._mapPowerUps.delete(puId);
 
     const duration = POWERUP_DURATION_MS[pu.type];
-    const now      = Date.now();
 
+    // SHIELD and LENGTH_BOOST don't become "active" power-ups —
+    // they modify growth state. GameLoop's collected-wrapper handles that.
+    // Just emit the event so the UI can show the pickup notification.
+    if (pu.type === POWERUP_TYPES.SHIELD || pu.type === POWERUP_TYPES.LENGTH_BOOST) {
+      console.log(`[PowerUp] ${socketId} collected ${pu.type} (counter/growth — no active timer)`);
+      this._onPowerUpCollected(socketId, pu.type, duration);
+      return;
+    }
+
+    // Multi-active model: keep a per-type record per player.
+    // Replacing same-type (a 2nd nitro pickup) extends the timer.
+    // Cross-category power-ups (ghost + nitro) coexist.
     const entry = {
       type:        pu.type,
-      activatedAt: now,
-      expiresAt:   duration !== null ? now + duration : null,
+      activatedAt: Date.now(),
+      expiresAt:   duration !== null ? Date.now() + duration : null,
     };
 
-    // Replacing an existing power-up — just overwrite
-    this._playerPowerUps.set(socketId, entry);
+    // Enforce category exclusivity: same speed-category replaces, same trail-category replaces
+    this._enforceCategoryExclusivity(socketId, pu.type);
+
+    let typesMap = this._playerActive.get(socketId);
+    if (!typesMap) {
+      typesMap = new Map();
+      this._playerActive.set(socketId, typesMap);
+    }
+    typesMap.set(pu.type, entry);
 
     console.log(`[PowerUp] ${socketId} collected ${pu.type} (duration: ${duration ?? 'until used'}ms)`);
     this._onPowerUpCollected(socketId, pu.type, duration);
   }
 
-  // ─── Shield consumption ───────────────────────────────────────────────────────
-
   /**
-   * Called by GameLoop when a trail collision is detected for a player.
-   * Returns true if the shield absorbed the hit (player survives).
-   * Removes the shield and emits powerUpUsed.
+   * If picking up `newType` conflicts with an existing active type in the same
+   * category, remove the old one and emit expired (so the UI can clear the icon).
    */
-  consumeShield(socketId) {
-    const active = this._playerPowerUps.get(socketId);
-    if (!active || active.type !== POWERUP_TYPES.SHIELD) return false;
+  _enforceCategoryExclusivity(socketId, newType) {
+    const cat = categoryOf(newType);
+    if (!cat) return;
 
-    this._playerPowerUps.delete(socketId);
-    console.log(`[PowerUp] ${socketId} shield consumed`);
+    const typesMap = this._playerActive.get(socketId);
+    if (!typesMap) return;
+
+    for (const [existingType] of typesMap) {
+      if (existingType !== newType && categoryOf(existingType) === cat) {
+        typesMap.delete(existingType);
+        this._onPowerUpExpired(socketId, existingType);
+      }
+    }
+  }
+
+  // ─── Shield consumption ───────────────────────────────────────────────────────
+  // Legacy method — kept for backward compatibility. Real shield consumption
+  // happens in GameLoop._consumeShield() against growth.shieldCount.
+  // This method is no longer called from GameLoop but is exported for tests.
+
+  consumeShield(socketId) {
+    if (!this._growth) return false;
+    const g = this._growth.get(socketId);
+    if (!g || g.shieldCount <= 0) return false;
+    g.shieldCount--;
     this._onPowerUpUsed(socketId, POWERUP_TYPES.SHIELD);
-    this._onPowerUpExpired(socketId, POWERUP_TYPES.SHIELD);
     return true;
   }
 
-  // ─── Effect queries (called by GameLoop per tick) ─────────────────────────────
+  // ─── Effect queries (per tick) ───────────────────────────────────────────────
 
-  /** Returns the speed multiplier for a player (1.0 if no effect) */
+  /**
+   * Returns the speed multiplier from active power-ups (1.0 if none).
+   * NITRO takes priority over SPEED_BOOST if somehow both are active
+   * (shouldn't happen due to category exclusivity, but defensive).
+   */
   getSpeedMultiplier(socketId) {
-    const active = this._playerPowerUps.get(socketId);
-    if (!active) return 1.0;
-    if (active.type === POWERUP_TYPES.NITRO) return 1.30;
+    const typesMap = this._playerActive.get(socketId);
+    if (!typesMap) return 1.0;
+    if (typesMap.has(POWERUP_TYPES.NITRO))       return NITRO_SPEED_MULTIPLIER;
+    if (typesMap.has(POWERUP_TYPES.SPEED_BOOST)) return SPEED_BOOST_MULTIPLIER;
     return 1.0;
   }
 
-  /** Returns the trail point radius for a player (PLAYER_RADIUS if no effect) */
+  /** Returns the trail point radius for a player (baseRadius if no effect) */
   getTrailRadius(socketId, baseRadius) {
-    const active = this._playerPowerUps.get(socketId);
-    if (!active) return baseRadius;
-    if (active.type === POWERUP_TYPES.FAT_TRAIL)  return baseRadius * 1.50;
-    if (active.type === POWERUP_TYPES.TINY_TRAIL) return baseRadius * 0.50;
+    const typesMap = this._playerActive.get(socketId);
+    if (!typesMap) return baseRadius;
+    if (typesMap.has(POWERUP_TYPES.FAT_TRAIL))  return baseRadius * FAT_TRAIL_RADIUS_MULTIPLIER;
+    if (typesMap.has(POWERUP_TYPES.TINY_TRAIL)) return baseRadius * TINY_TRAIL_RADIUS_MULTIPLIER;
     return baseRadius;
   }
 
-  /** Returns true if the player has Ghost active (ignores trail collisions) */
   hasGhost(socketId) {
-    const active = this._playerPowerUps.get(socketId);
-    return active?.type === POWERUP_TYPES.GHOST;
+    return this._playerActive.get(socketId)?.has(POWERUP_TYPES.GHOST) ?? false;
   }
 
-  /** Returns true if the player has Shield active */
   hasShield(socketId) {
-    const active = this._playerPowerUps.get(socketId);
-    return active?.type === POWERUP_TYPES.SHIELD;
+    if (!this._growth) return false;
+    const g = this._growth.get(socketId);
+    return (g?.shieldCount ?? 0) > 0;
   }
 
-  /** Returns the active power-up type for a player, or null */
+  /**
+   * Legacy single-active accessor — returns the "most interesting" active
+   * power-up for the scoreboard. Prefer getActivePowerUpsArray for full state.
+   */
   getActivePowerUp(socketId) {
-    const active = this._playerPowerUps.get(socketId);
-    if (!active) return null;
-    const remaining = active.expiresAt !== null
-      ? Math.max(0, active.expiresAt - Date.now())
+    const typesMap = this._playerActive.get(socketId);
+    if (!typesMap || typesMap.size === 0) return null;
+    // Return the most recently activated one
+    let latest = null;
+    for (const entry of typesMap.values()) {
+      if (!latest || entry.activatedAt > latest.activatedAt) latest = entry;
+    }
+    if (!latest) return null;
+    const remaining = latest.expiresAt !== null
+      ? Math.max(0, latest.expiresAt - Date.now())
       : null;
-    return { type: active.type, remainingMs: remaining };
+    return { type: latest.type, remainingMs: remaining };
   }
 
-  /** Returns the current map power-ups as an array for gameState */
+  /**
+   * Returns ALL active power-ups for a player.
+   * Used in gameState.players[].activePowerups for the new UI.
+   *
+   * @returns {Array<{type, expiresAt}>}
+   */
+  getActivePowerUpsArray(socketId) {
+    const typesMap = this._playerActive.get(socketId);
+    if (!typesMap || typesMap.size === 0) return [];
+    return [...typesMap.values()].map(e => ({
+      type:      e.type,
+      expiresAt: e.expiresAt,
+    }));
+  }
+
   getMapPowerUps() {
     return [...this._mapPowerUps.values()].map(pu => ({
       id:        pu.id,
@@ -233,20 +301,18 @@ class PowerUpManager {
     this._spawnTimer = setTimeout(() => this._trySpawn(), delay);
   }
 
-  _trySpawn(trails = null) {
+  _trySpawn() {
     if (!this._running) return;
 
     if (this._mapPowerUps.size >= POWERUP_MAX_ON_MAP) {
-      // Already at max — try again shortly
       console.log(`[PowerUp] Spawn delayed — max ${POWERUP_MAX_ON_MAP} on map`);
-      this._spawnTimer = setTimeout(() => this._trySpawn(trails), 2_000);
+      this._spawnTimer = setTimeout(() => this._trySpawn(), 2_000);
       return;
     }
 
-    const pos = this._findSafePosition(trails);
+    const pos = this._findSafePosition();
     if (!pos) {
-      // Couldn't find a safe spot — retry soon
-      this._spawnTimer = setTimeout(() => this._trySpawn(trails), 2_000);
+      this._spawnTimer = setTimeout(() => this._trySpawn(), 2_000);
       return;
     }
 
@@ -267,41 +333,71 @@ class PowerUpManager {
     this._scheduleNextSpawn();
   }
 
-  /**
-   * The spawn method is also exposed so GameLoop can pass current trails
-   * for a more accurate safe-position check.
-   */
   triggerSpawnCheck(trails) {
     this._currentTrails = trails;
   }
 
-  _findSafePosition(trails) {
-    const margin = POWERUP_SPAWN_WALL_MARGIN;
+  /**
+   * Find a safe spawn position inside the CURRENT arena bounds (shrinks!).
+   * Avoids walls, trails, and other alive players' heads.
+   */
+  _findSafePosition() {
+    // Spawn bounds come from the current arena (shrinks!)
+    const bounds = this._arena
+      ? this._arena.getCurrentBounds()
+      : { x: 0, y: 0, width: 1200, height: 900 };  // fallback
+
+    const margin    = POWERUP_SPAWN_WALL_MARGIN;
     const clearance = POWERUP_SPAWN_TRAIL_CLEARANCE;
+    const playerClr = POWERUP_SPAWN_PLAYER_CLEARANCE;
+
+    const minX = bounds.x + margin;
+    const maxX = bounds.x + bounds.width  - margin;
+    const minY = bounds.y + margin;
+    const maxY = bounds.y + bounds.height - margin;
+
+    if (minX >= maxX || minY >= maxY) return null;
 
     for (let attempt = 0; attempt < 30; attempt++) {
-      const x = margin + Math.random() * (ARENA_WIDTH  - margin * 2);
-      const y = margin + Math.random() * (ARENA_HEIGHT - margin * 2);
+      const x = minX + Math.random() * (maxX - minX);
+      const y = minY + Math.random() * (maxY - minY);
 
-      if (!trails) return { x, y };  // no trail data yet, accept position
-
-      // Check distance from all trail points
-      let safe = true;
-      outer:
-      for (const [, trail] of trails) {
-        for (const pt of trail) {
-          if (pt.gap) continue;
-          const dx = x - pt.x;
-          const dy = y - pt.y;
-          if (dx * dx + dy * dy < clearance * clearance) {
-            safe = false;
-            break outer;
+      // Player clearance — don't spawn on top of someone
+      if (this._currentPlayers) {
+        let tooClose = false;
+        for (const [, p] of this._currentPlayers) {
+          if (!p.alive) continue;
+          const dx = x - p.x;
+          const dy = y - p.y;
+          if (dx * dx + dy * dy < playerClr * playerClr) {
+            tooClose = true;
+            break;
           }
         }
+        if (tooClose) continue;
       }
-      if (safe) return { x, y };
+
+      // Trail clearance
+      if (this._currentTrails) {
+        let safe = true;
+        outer:
+        for (const [, trail] of this._currentTrails) {
+          for (const pt of trail) {
+            if (pt.gap) continue;
+            const dx = x - pt.x;
+            const dy = y - pt.y;
+            if (dx * dx + dy * dy < clearance * clearance) {
+              safe = false;
+              break outer;
+            }
+          }
+        }
+        if (!safe) continue;
+      }
+
+      return { x, y };
     }
-    return null; // couldn't find a safe spot in 30 attempts
+    return null;
   }
 
   _weightedRandom() {
@@ -316,6 +412,23 @@ class PowerUpManager {
   _emitMapUpdate() {
     this._onPowerUpsUpdate(this.getMapPowerUps());
   }
+}
+
+// ─── Category helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Two active power-ups are MUTUALLY EXCLUSIVE if they share a category.
+ * Otherwise they can stack.
+ *
+ * Categories:
+ *   'speed'  — NITRO, SPEED_BOOST     (only one active at a time)
+ *   'trail'  — FAT_TRAIL, TINY_TRAIL  (only one active at a time)
+ *   null     — independent (GHOST stands alone — never conflicts)
+ */
+function categoryOf(type) {
+  if (type === POWERUP_TYPES.NITRO || type === POWERUP_TYPES.SPEED_BOOST) return 'speed';
+  if (type === POWERUP_TYPES.FAT_TRAIL || type === POWERUP_TYPES.TINY_TRAIL) return 'trail';
+  return null;
 }
 
 module.exports = { PowerUpManager };

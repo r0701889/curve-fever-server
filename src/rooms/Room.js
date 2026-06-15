@@ -92,6 +92,17 @@ class Room {
     // next available color instead.
     this._walletColors = new Map();
 
+    // socketId → { lengthMultiplier, speedMultiplier, shieldCount, eliminations }
+    // PERSISTS ACROSS ROUNDS in the same match. Reset on rematch.
+    //   - lengthMultiplier: 1.0 → 2.5 (cap). +0.20 per Length Boost pickup,
+    //                       +0.10 per elimination.
+    //   - speedMultiplier:  1.0 → 1.25 (cap). +0.05 per elimination.
+    //                       (Length Boost does NOT affect speed.)
+    //   - shieldCount:      0 → 3 (cap). +1 per Shield pickup. -1 on trail hit.
+    //   - eliminations:     counter for scoreboard/debug.
+    // Initialised lazily in _ensureGrowth(socketId).
+    this._growth = new Map();
+
     this._gameLoop       = null;
     this._matchId        = null;
     this._countdownTimer = null;
@@ -131,12 +142,28 @@ class Room {
     this._players.set(socketId, { socketId, wallet, ready: false });
 
     this._assignColor(socketId, wallet);
+    this._ensureGrowth(socketId);
 
     if (!this._usernames.has(socketId)) {
       this._usernames.set(socketId, username || wallet);
     }
     if (!this._wins.has(socketId)) this._wins.set(socketId, 0);
     if (!this._alive.has(socketId)) this._alive.set(socketId, true);
+  }
+
+  /**
+   * Initialise the growth record for a player if it doesn't exist yet.
+   * Idempotent — safe to call on every join (existing growth is preserved).
+   */
+  _ensureGrowth(socketId) {
+    if (!this._growth.has(socketId)) {
+      this._growth.set(socketId, {
+        lengthMultiplier: 1.0,
+        speedMultiplier:  1.0,
+        shieldCount:      0,
+        eliminations:     0,
+      });
+    }
   }
 
   /**
@@ -194,14 +221,20 @@ class Room {
   _buildScoreboard() {
     const entries = [...this._players.keys()].map(socketId => {
       const player = this._players.get(socketId);
+      const growth = this._growth.get(socketId);
       return {
         socketId,
-        wallet:        player.wallet,
-        username:      this._usernames.get(socketId) ?? player.wallet,
-        color:         this._colors.get(socketId)    ?? '#FFFFFF',
-        wins:          this._wins.get(socketId)      ?? 0,
-        alive:         this._alive.get(socketId)     ?? true,
-        activePowerUp: this._gameLoop?.getActivePowerUp(socketId) ?? null,
+        wallet:           player.wallet,
+        username:         this._usernames.get(socketId) ?? player.wallet,
+        color:            this._colors.get(socketId)    ?? '#FFFFFF',
+        wins:             this._wins.get(socketId)      ?? 0,
+        alive:            this._alive.get(socketId)     ?? true,
+        activePowerUp:    this._gameLoop?.getActivePowerUp(socketId) ?? null,
+        // Growth fields — persist across rounds in this match
+        lengthMultiplier: growth?.lengthMultiplier ?? 1.0,
+        speedMultiplier:  growth?.speedMultiplier  ?? 1.0,
+        shieldCount:      growth?.shieldCount      ?? 0,
+        eliminations:     growth?.eliminations     ?? 0,
       };
     });
 
@@ -454,6 +487,7 @@ class Room {
       playerIds,
       wallets,
       colors:             this._colors,
+      growth:             this._growth,
       onGameState:        snap                     => this._onGameState(snap),
       onPlayerDied:       (id, wallet, reason)     => this._onPlayerDied(id, wallet, reason),
       onRoundEnded:       (winnerId, winnerWallet) => this._onRoundEnded(winnerId, winnerWallet),
@@ -461,9 +495,33 @@ class Room {
       onPowerUpCollected: (socketId, type, dur)    => this._onPowerUpCollected(socketId, type, dur),
       onPowerUpExpired:   (socketId, type)         => this._onPowerUpExpired(socketId, type),
       onPowerUpUsed:      (socketId, type)         => this._onPowerUpUsed(socketId, type),
+      onPlayerGrowth:     (socketId, growthData)   => this._onPlayerGrowth(socketId, growthData),
+      onArenaPhaseChange: (phase, snap)            => this._onArenaPhaseChange(phase, snap),
     });
 
     this._gameLoop.start();
+  }
+
+  // ─── Growth & arena callbacks ────────────────────────────────────────────────
+
+  // NOTE: growth and arena-phase changes are intentionally NOT emitted as
+  // their own socket events. Emblem reads everything it needs from the
+  // per-tick gameState snapshot:
+  //   - growth        -> players[].lengthMultiplier / shieldCount / activePowerups
+  //   - trail width   -> trails[].r
+  //   - arena phase   -> arena.phase / arena.warningEndsAt / arena.shrinkProgress
+  // Keeping these out of the event stream keeps the protocol simple. A
+  // dedicated playerGrowth event can be re-added later for special kill/growth
+  // UI animations. The callbacks below are kept (no socket emit) so GameLoop's
+  // interface is unchanged and the shared _growth map is still updated.
+
+  _onPlayerGrowth(_socketId, _growthData) {
+    // Intentionally no socket emit — growth is surfaced via gameState only.
+  }
+
+  _onArenaPhaseChange(newPhase, _arenaSnapshot) {
+    // Server-side log only — no socket emit. Phase is in gameState.arena.phase.
+    console.log(`[Room ${this.roomId}] Arena phase -> ${newPhase}`);
   }
 
   // ─── Game callbacks ───────────────────────────────────────────────────────────
@@ -670,6 +728,7 @@ class Room {
     this._wins.clear();
     this._alive.clear();
     this._colors.clear();
+    this._growth.clear();   // Growth resets on rematch — NOT between rounds within a match
 
     this.state        = 'lobby';
     this.currentRound = 0;

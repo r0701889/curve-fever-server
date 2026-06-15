@@ -79,9 +79,20 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *   rematchJoined        { roomId, lobbyState }
  *   lobbyFull            { message }
  *   powerUpsUpdate       { powerUps }
+ *                          powerUps[]: { id, type, x, y, expiresAt }
+ *                          Types: 'ghost' | 'nitro' | 'shield' | 'speed_boost' |
+ *                                 'length_boost' | 'fat_trail' | 'tiny_trail'
  *   powerUpCollected     { socketId, playerWallet, playerUsername, type, duration }
+ *                          duration is null for shield (counter) and length_boost (instant).
  *   powerUpExpired       { socketId, playerWallet, type }
  *   powerUpUsed          { socketId, playerWallet, type }
+ *
+ *   NOTE: growth and arena-phase are NOT separate events. They are read
+ *   from the per-tick gameState snapshot:
+ *     - growth:     gameState.players[].lengthMultiplier / shieldCount / activePowerups
+ *     - trail width: gameState.trails[].r
+ *     - arena:      gameState.arena.{ current, next, phase, warningEndsAt,
+ *                   shrinkEndsAt, shrinkProgress }
  *
  *   inviteReceived       { roomId, fromWallet, fromUsername,
  *                          targetWallet, targetUsername,

@@ -5,13 +5,21 @@ const { PLAYER_RADIUS, ARENA_WIDTH, ARENA_HEIGHT } = require('./constants');
 /**
  * Returns true if the player head at (x,y) touches an arena wall.
  * Always lethal — Ghost and Shield do NOT protect against walls.
+ *
+ * The arena bounds can be passed dynamically (for shrinking arena support).
+ * Defaults to the full constants if not provided.
+ *
+ * @param {number} x
+ * @param {number} y
+ * @param {{x,y,width,height}} [bounds]
  */
-function collidesWithWall(x, y) {
+function collidesWithWall(x, y, bounds) {
+  const b = bounds ?? { x: 0, y: 0, width: ARENA_WIDTH, height: ARENA_HEIGHT };
   return (
-    x - PLAYER_RADIUS < 0 ||
-    x + PLAYER_RADIUS > ARENA_WIDTH ||
-    y - PLAYER_RADIUS < 0 ||
-    y + PLAYER_RADIUS > ARENA_HEIGHT
+    x - PLAYER_RADIUS < b.x ||
+    x + PLAYER_RADIUS > b.x + b.width ||
+    y - PLAYER_RADIUS < b.y ||
+    y + PLAYER_RADIUS > b.y + b.height
   );
 }
 
