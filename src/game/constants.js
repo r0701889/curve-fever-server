@@ -34,13 +34,37 @@ const PLAYER_SPEED        = PLAYER_SPEED_PPS / TICK_RATE;   // 1.25 px/tick
 const TURN_RATE           = TURN_RATE_RPS    / TICK_RATE;   // 0.0275 rad/tick
 const PLAYER_RADIUS       = 3;
 
-// ─── Trail ────────────────────────────────────────────────────────────────────
+// ─── Snake Body ───────────────────────────────────────────────────────────────
+//
+// Permanent trails are GONE. Each player is a fixed-length snake body:
+// the head leads, bodyPoints follow, and the tail is continuously trimmed
+// so the head-to-tail path distance stays close to bodyLengthPx.
+//
+// bodyLengthPx is derived from lengthMultiplier (the same growth value that
+// drove trail-point radius before): effectiveBodyLengthPx =
+//   BASE_BODY_LENGTH_PX * lengthMultiplier
+//
+// MAX_BODY_LENGTH_MULTIPLIER reuses GROWTH_MAX_LENGTH — body length and trail
+// radius share the same growth cap (2.5x).
 
-const GAP_INTERVAL_S      = 6;
-const GAP_DURATION_S      = 0.4;
+const BASE_BODY_LENGTH_PX = 120;   // starting head-to-tail length, in px
 
-const TRAIL_GAP_INTERVAL  = Math.round(GAP_INTERVAL_S * TICK_RATE);  // 360 ticks
-const TRAIL_GAP_DURATION  = Math.round(GAP_DURATION_S * TICK_RATE);  // 24 ticks
+// Self-collision: the few points immediately behind the head are always
+// within head-radius of the head itself (continuous movement) and must be
+// skipped, regardless of bodyLengthPx. This is independent of growth.
+const BODY_SELF_SKIP_POINTS = 8;
+
+// Network payload: gameState.players[].bodyPoints is decimated for
+// transmission — server simulates every tick internally, but only sends
+// every Nth point, capped at a maximum count, to keep snapshots small even
+// at max growth (2.5x * 120px / ~1.25px-per-tick ≈ 240 simulated points).
+const BODY_POINT_SAMPLE_STRIDE = 4;   // send every 4th simulated point
+const BODY_POINT_MAX_SENT      = 40;  // hard cap on points sent per player
+
+// bodyPoints are sent as compact arrays [x, y, r] instead of {x,y,r} objects
+// (~16 bytes vs ~28 bytes per point — ~43% smaller). At BODY_POINT_MAX_SENT=40
+// and 8 players, worst case ≈ 40 * 16 * 8 ≈ 5.1KB for body data alone —
+// comfortable for a 60Hz broadcast.
 
 // ─── Room ─────────────────────────────────────────────────────────────────────
 
@@ -137,10 +161,14 @@ const GROWTH_SPEED_PER_ELIMINATION = 0.05;  // +0.05 to speedMultiplier per kill
 const GROWTH_MAX_LENGTH            = 2.50;  // cap — never bigger than 2.5×
 const GROWTH_MAX_SPEED             = 1.25;  // cap — never faster than 1.25×
 
+// Explicit alias requested for the snake-body system — same cap as
+// GROWTH_MAX_LENGTH (one number, two names for clarity at call sites).
+const MAX_BODY_LENGTH_MULTIPLIER   = GROWTH_MAX_LENGTH;
+
 // Power-up spawn — interval/limit/safety
 const POWERUP_SPAWN_PLAYER_CLEARANCE = 150;  // px from any alive player's head
 const POWERUP_SPAWN_WALL_MARGIN      = 50;   // px from current arena wall
-const POWERUP_SPAWN_TRAIL_CLEARANCE  = 20;   // px from any trail point
+const POWERUP_SPAWN_TRAIL_CLEARANCE  = 20;   // px from any current snake-body point
 
 module.exports = {
   // Arena (starting dimensions and shrink cycle)
@@ -160,9 +188,11 @@ module.exports = {
   TURN_RATE,
   TURN_RATE_RPS,
   PLAYER_RADIUS,
-  // Trail
-  TRAIL_GAP_INTERVAL,
-  TRAIL_GAP_DURATION,
+  // Snake body
+  BASE_BODY_LENGTH_PX,
+  BODY_SELF_SKIP_POINTS,
+  BODY_POINT_SAMPLE_STRIDE,
+  BODY_POINT_MAX_SENT,
   // Tick
   TICK_RATE,
   TICK_INTERVAL_MS,
@@ -202,4 +232,5 @@ module.exports = {
   GROWTH_SPEED_PER_ELIMINATION,
   GROWTH_MAX_LENGTH,
   GROWTH_MAX_SPEED,
+  MAX_BODY_LENGTH_MULTIPLIER,
 };

@@ -43,7 +43,7 @@ const TOTAL_WEIGHT = POWERUP_WEIGHTS.reduce((s, e) => s + e.weight, 0);
  *   onPowerUpsUpdate(powerUps)             — map changed (spawn/collect/expire)
  *   onPowerUpCollected(socketId, type, ms) — player picked up a power-up
  *   onPowerUpExpired(socketId, type)       — active power-up timer ran out
- *   onPowerUpUsed(socketId, type)          — shield consumed on trail hit (legacy — kept for compat)
+ *   onPowerUpUsed(socketId, type)          — shield consumed on body hit
  *
  * Dependencies:
  *   arena   — ArenaManager (for spawn bounds)
@@ -68,7 +68,7 @@ class PowerUpManager {
 
     this._spawnTimer    = null;
     this._running       = false;
-    this._currentTrails = null;
+    this._currentBodies = null;  // socketId -> current snake body points
     this._currentPlayers = null;
   }
 
@@ -229,7 +229,7 @@ class PowerUpManager {
     return 1.0;
   }
 
-  /** Returns the trail point radius for a player (baseRadius if no effect) */
+  /** Returns the snake body-point radius for a player (baseRadius if no effect) */
   getTrailRadius(socketId, baseRadius) {
     const typesMap = this._playerActive.get(socketId);
     if (!typesMap) return baseRadius;
@@ -333,13 +333,13 @@ class PowerUpManager {
     this._scheduleNextSpawn();
   }
 
-  triggerSpawnCheck(trails) {
-    this._currentTrails = trails;
+  triggerSpawnCheck(bodies) {
+    this._currentBodies = bodies;
   }
 
   /**
    * Find a safe spawn position inside the CURRENT arena bounds (shrinks!).
-   * Avoids walls, trails, and other alive players' heads.
+   * Avoids walls, current snake bodies, and other alive players' heads.
    */
   _findSafePosition() {
     // Spawn bounds come from the current arena (shrinks!)
@@ -377,13 +377,12 @@ class PowerUpManager {
         if (tooClose) continue;
       }
 
-      // Trail clearance
-      if (this._currentTrails) {
+      // Body clearance — don't spawn on top of any current snake body
+      if (this._currentBodies) {
         let safe = true;
         outer:
-        for (const [, trail] of this._currentTrails) {
-          for (const pt of trail) {
-            if (pt.gap) continue;
+        for (const [, body] of this._currentBodies) {
+          for (const pt of body) {
             const dx = x - pt.x;
             const dy = y - pt.y;
             if (dx * dx + dy * dy < clearance * clearance) {

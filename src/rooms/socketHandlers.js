@@ -67,8 +67,16 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *                          Sent exactly gameStartAt (5s after gameStarting).
  *                          The game loop begins only after this event.
  *   roundStarted         { roomId, currentRound, rounds, winsRequired, scoreboard }
- *   gameState            { tick, players, trails, scoreboard, powerUps } — 60×/sec
+ *   gameState            { tick, players, powerUps, arena } — 60×/sec
+ *                          NO permanent trails. Each players[] entry carries
+ *                          its own current snake body — see players[] below.
  *   playerDied           { socketId, wallet, reason }
+ *                          reason: 'wall' | 'trail' | 'shrink'
+ *                          'wall'   — hit the arena/shrink boundary (always lethal)
+ *                          'trail'  — hit a snake body (own or another player's
+ *                                     CURRENT body — never an old/permanent trail)
+ *                          'shrink' — caught outside the active arena after
+ *                                     the grace period during shrinking
  *   scoreboardUpdate     { scoreboard }
  *   roundEnded           { roomId, roundWinnerWallet, roundWinnerId, draw,
  *                          scoreboard, currentRound, rounds, winsRequired,
@@ -89,10 +97,26 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *
  *   NOTE: growth and arena-phase are NOT separate events. They are read
  *   from the per-tick gameState snapshot:
- *     - growth:     gameState.players[].lengthMultiplier / shieldCount / activePowerups
- *     - trail width: gameState.trails[].r
- *     - arena:      gameState.arena.{ current, next, phase, warningEndsAt,
- *                   shrinkEndsAt, shrinkProgress }
+ *     - growth:      gameState.players[].lengthMultiplier / shieldCount / activePowerups
+ *     - snake body:   gameState.players[].bodyPoints[] (each {x,y,r}) and
+ *                     gameState.players[].bodyLengthPx — NO permanent trail,
+ *                     this IS the entire current body (head-to-tail)
+ *     - arena:       gameState.arena.{ current, next, phase, warningEndsAt,
+ *                     shrinkEndsAt, shrinkProgress }
+ *
+ *   gameState.players[] full shape:
+ *     {
+ *       id, wallet, color, x, y, angle, alive,
+ *       bodyLengthPx,       // current target head-to-tail length in px
+ *       lengthMultiplier,   // growth multiplier (1.0 - 2.5), drives bodyLengthPx
+ *                            // and bodyPoints[].r (3rd array element)
+ *       bodyPoints,         // [[x,y,r], ...] — current snake body, tail-to-head
+ *                            // order. Compact arrays, NOT {x,y,r} objects.
+ *                            // Decimated for network (NOT the full simulated body) —
+ *                            // up to BODY_POINT_MAX_SENT (40) points.
+ *       activePowerups,     // [{type, expiresAt}]
+ *       shieldCount,        // 0-3
+ *     }
  *
  *   inviteReceived       { roomId, fromWallet, fromUsername,
  *                          targetWallet, targetUsername,
