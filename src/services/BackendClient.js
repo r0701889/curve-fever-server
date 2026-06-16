@@ -140,21 +140,26 @@ async function _withRetries(fn, { attempts = 3, delayMs = 500 } = {}) {
 /**
  * Create (or fetch, if already exists) a match record in the backend.
  *
- * IDEMPOTENT — safe to call multiple times with the same roomId.
- * matchId is set to roomId by convention, so verify-payment can find the
- * match immediately, even before startGame is called.
+ * IDEMPOTENT — safe to call multiple times with the same matchId.
  *
- * @param {string} roomId       — Socket.io room code, also used as matchId
+ * For the first match: matchId === roomId (by convention).
+ * For rematches: matchId is "${roomId}_r1", "_r2" etc. (new unique ID each time),
+ * while roomId stays the same. This allows Emblem to look up the latest match
+ * via GET /matches/:roomId (falls back to room_id in the backend) while the
+ * verify-payment flow uses the new matchId against a fresh 'pending' record.
+ *
+ * @param {string} matchId       — primary key for this match (roomId or roomId_rN)
+ * @param {string} roomId        — stable Socket.io room code
  * @param {number} entryFeeUsdc
  * @param {number} maxPlayers
- * @param {number} rounds       — BO format (1,3,5,7,9)
+ * @param {number} rounds        — BO format (1,3,5,7,9)
  * @param {string} gameType
- * @param {string} [hostWallet] — informational only
+ * @param {string} [hostWallet]  — informational only
  * @returns {Promise<{ matchId, roomId, alreadyExists?: boolean } | null>}
  */
-async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1, gameType = 'curve_fever', hostWallet = null) {
+async function createMatch(matchId, roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1, gameType = 'curve_fever', hostWallet = null) {
   const body = {
-    matchId:  roomId,
+    matchId,
     roomId,
     entryFeeUsdc,
     maxPlayers,
@@ -166,8 +171,6 @@ async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1,
 
   try {
     // Retried — this is the persistence point Emblem's GET /matches/:id depends on.
-    // A single transient failure here (cold start, brief network blip) must not
-    // silently leave the match unqueryable for the rest of its lifetime.
     const result = await _withRetries(() => post('/api/matches', body), { attempts: 3, delayMs: 500 });
 
     if (result?.alreadyExists) {
@@ -178,7 +181,7 @@ async function createMatch(roomId, entryFeeUsdc = 0, maxPlayers = 6, rounds = 1,
 
     return result;
   } catch (err) {
-    console.error(`[BackendClient] [match_register_failed] roomId=${roomId} error=${err.message}`);
+    console.error(`[BackendClient] [match_register_failed] matchId=${matchId} roomId=${roomId} error=${err.message}`);
     return null;
   }
 }
@@ -298,4 +301,32 @@ async function cancelMatch(matchId) {
   }
 }
 
-module.exports = { createMatch, registerPlayers, startMatch, finishMatch, cancelMatch };
+/**
+ * Notify the backend's social realtime layer (SSE) that something should
+ * be pushed instantly to a specific wallet. Currently used only for room
+ * invites — lobby state (the thing being announced) only exists here in
+ * the game server, not in the backend's DB, so the game server has to be
+ * the one to initiate this push.
+ *
+ * Best-effort / fire-and-forget: this NEVER throws. A failure here can't
+ * break the invite itself — the existing in-game socket emit (inviteReceived)
+ * already happened separately, synchronously, and is unaffected either way.
+ * Worst case, the target wallet just doesn't get the cross-app push and
+ * falls back to whatever they'd see next time they poll/refresh.
+ *
+ * @param {string} event         one of the backend's allowed internal event
+ *                                names (currently roomInvite*) — see
+ *                                ALLOWED_INTERNAL_EVENTS in the backend's
+ *                                routes/social.js
+ * @param {string} targetWallet
+ * @param {object} payload
+ */
+async function notifySocial(event, targetWallet, payload) {
+  try {
+    await post('/api/social/notify', { event, targetWallet, payload });
+  } catch (err) {
+    console.error(`[BackendClient] notifySocial(${event}) failed for ${targetWallet}: ${err.message}`);
+  }
+}
+
+module.exports = { createMatch, registerPlayers, startMatch, finishMatch, cancelMatch, notifySocial };

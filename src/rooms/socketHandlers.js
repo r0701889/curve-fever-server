@@ -1,14 +1,22 @@
 'use strict';
 
-const { RoomManager }  = require('./RoomManager');
-const { UserRegistry } = require('./UserRegistry');
 const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants');
+const BackendClient = require('../services/BackendClient');
+
+// Confirmed default for the new cross-app social invite push — see plan
+// approval. Only affects the expiresAt field sent to the backend's /social
+// layer; does NOT change anything about the existing in-game inviteReceived
+// event below, and does NOT (yet) enforce expiry server-side on join —
+// that would require touching joinRoom/acceptInvite, explicitly out of
+// scope for this change.
+const INVITE_EXPIRY_MS = 3 * 60 * 1000;
 
 /**
  * ── Client → Server ───────────────────────────────────────────────────────────
  *
  *   registerUser   { wallet, username? }
- *                  Must be called once after connect before using invite features.
+ *                  Must be called once after connect before using invite
+ *                  features. Also marks this wallet ONLINE in PresenceService.
  *
  *   createRoom     { wallet, username?, rounds?, entryFee? }
  *   joinRoom       { roomId, wallet, username? }
@@ -28,6 +36,17 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *
  *   declineInvite  { roomId, wallet, fromWallet }
  *                  Notifies the inviter that the invite was declined.
+ *
+ * ── Cheat-resistance contract — what the client is NEVER trusted to send ──────
+ *
+ *   The client has NO event for: position, speed, collision, winner,
+ *   powerupCollected, or payout. Every one of those is computed and emitted
+ *   exclusively by the server (GameLoop / Room / PowerUpManager / backend).
+ *   playerInput only ever carries a direction enum ('left'|'right'|'neutral') —
+ *   never a position or velocity. If a future event needs adding, this
+ *   contract is the bar it must clear: does it let the client assert a fact
+ *   about game state, or only express player INTENT for the server to
+ *   validate? Only the latter is acceptable here.
  *
  * ── Server → Client ───────────────────────────────────────────────────────────
  *
@@ -67,9 +86,14 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *                          Sent exactly gameStartAt (5s after gameStarting).
  *                          The game loop begins only after this event.
  *   roundStarted         { roomId, currentRound, rounds, winsRequired, scoreboard }
- *   gameState            { tick, players, powerUps, arena } — 60×/sec
- *                          NO permanent trails. Each players[] entry carries
- *                          its own current snake body — see players[] below.
+ *   gameState            { tick, players, powerUps, arena}
+ *                          Sent ~20×/sec (GAMESTATE_SEND_RATE_HZ) — NOT 60×/sec.
+ *                          Physics/collision still run at 60Hz internally; only
+ *                          this broadcast is rate-limited. Interpolate between
+ *                          the last two received snapshots for smooth motion
+ *                          rather than snapping directly to each new position.
+ *                          NO permanent lethal trails. Each players[] entry
+ *                          carries its own current snake body — see below.
  *   playerDied           { socketId, wallet, reason }
  *                          reason: 'wall' | 'trail' | 'shrink'
  *                          'wall'   — hit the arena/shrink boundary (always lethal)
@@ -98,9 +122,12 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *   NOTE: growth and arena-phase are NOT separate events. They are read
  *   from the per-tick gameState snapshot:
  *     - growth:      gameState.players[].lengthMultiplier / shieldCount / activePowerups
- *     - snake body:   gameState.players[].bodyPoints[] (each {x,y,r}) and
- *                     gameState.players[].bodyLengthPx — NO permanent trail,
- *                     this IS the entire current body (head-to-tail)
+ *     - snake body:   gameState.players[].bodyPoints[] (each [x,y,r]) — LETHAL,
+ *                     use for collision. NO permanent trail — this IS the
+ *                     entire current body (head-to-tail).
+ *     - visual trail: gameState.players[].visualTrail[] (each [x,y,r,alpha]) —
+ *                     NON-LETHAL, cosmetic fading trace only. NEVER use this
+ *                     for client-side collision/prediction.
  *     - arena:       gameState.arena.{ current, next, phase, warningEndsAt,
  *                     shrinkEndsAt, shrinkProgress }
  *
@@ -110,10 +137,10 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *       bodyLengthPx,       // current target head-to-tail length in px
  *       lengthMultiplier,   // growth multiplier (1.0 - 2.5), drives bodyLengthPx
  *                            // and bodyPoints[].r (3rd array element)
- *       bodyPoints,         // [[x,y,r], ...] — current snake body, tail-to-head
- *                            // order. Compact arrays, NOT {x,y,r} objects.
- *                            // Decimated for network (NOT the full simulated body) —
- *                            // up to BODY_POINT_MAX_SENT (40) points.
+ *       bodyPoints,         // [[x,y,r], ...] — LETHAL current snake body,
+ *                            // tail-to-head order, decimated for network.
+ *       visualTrail,        // [[x,y,r,alpha], ...] — NON-LETHAL fading trace,
+ *                            // oldest-to-newest, alpha 1.0→0.0. Render only.
  *       activePowerups,     // [{type, expiresAt}]
  *       shieldCount,        // 0-3
  *     }
@@ -121,7 +148,15 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *   inviteReceived       { roomId, fromWallet, fromUsername,
  *                          targetWallet, targetUsername,
  *                          entryFee, rounds, playersCount, maxPlayers }
- *                          → sent to target socket only
+ *                          → sent to target socket only. UNCHANGED — only
+ *                          reaches the target if they already have a game
+ *                          socket open. As of this change, sendInvite ALSO
+ *                          pushes a roomInviteReceived event (different
+ *                          field names, see BackendClient.notifySocial)
+ *                          through the backend's separate /social SSE
+ *                          channel, so the target gets notified even with
+ *                          no game client open at all. Two channels, two
+ *                          payload shapes, deliberately not unified here.
  *
  *   inviteDeclined       { roomId, wallet }
  *                          → sent to inviter socket only
@@ -133,9 +168,20 @@ const { VALID_ROUNDS, DEFAULT_ROUNDS, MAX_PLAYERS } = require('../game/constants
  *   [{ wallet, username, color, wins, alive, rank, activePowerUp }]
  *   activePowerUp: { type, remainingMs } | null
  */
-function registerSocketHandlers(io) {
-  const manager  = new RoomManager(io);
-  const registry = new UserRegistry();
+
+/**
+ * @param {import('socket.io').Server} io
+ * @param {object} deps                       injected so index.js is the
+ *                                              single place stores/services
+ *                                              are constructed — and the
+ *                                              single place they'd be swapped
+ *                                              for Redis-backed equivalents.
+ * @param {import('./RoomManager').RoomManager} deps.manager
+ * @param {import('./UserRegistry').UserRegistry} deps.registry
+ * @param {import('../presence/PresenceService').PresenceService} deps.presenceService
+ */
+function registerSocketHandlers(io, deps) {
+  const { manager, registry, presenceService } = deps;
 
   io.on('connection', (socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
@@ -143,7 +189,9 @@ function registerSocketHandlers(io) {
     // ── registerUser ───────────────────────────────────────────────────────────
     // Payload: { wallet, username? }
     // Must be called once after connecting to enable invite features.
-    socket.on('registerUser', (payload = {}) => {
+    // Also marks the wallet ONLINE in PresenceService — this is the only
+    // social-system touch point in the entire connection handler.
+    socket.on('registerUser', async (payload = {}) => {
       const { wallet, username } = payload;
 
       if (!isValidWallet(wallet)) {
@@ -151,11 +199,15 @@ function registerSocketHandlers(io) {
       }
 
       const sanitised = sanitizeUsername(username, wallet);
-      registry.register(socket.id, wallet, sanitised);
+      await registry.register(socket.id, wallet, sanitised);
+      // Remember which wallet this socket registered as, so disconnect can
+      // mark it offline without needing another registry round-trip.
+      socket.data.registeredWallet = wallet;
+      await presenceService.goOnline(wallet, socket.id);
     });
 
     // ── createRoom ─────────────────────────────────────────────────────────────
-    socket.on('createRoom', (payload = {}) => {
+    socket.on('createRoom', async (payload = {}) => {
       const { wallet, username, rounds, entryFee } = payload;
       console.log(`[Socket] createRoom — socket: ${socket.id}, wallet: ${JSON.stringify(wallet)}, rounds: ${rounds}`);
 
@@ -167,7 +219,7 @@ function registerSocketHandlers(io) {
       const validatedFee      = Number.isInteger(entryFee) && entryFee >= 0 ? entryFee : 0;
       const validatedUsername = sanitizeUsername(username, wallet);
 
-      const result = manager.createRoom(socket.id, wallet, validatedUsername, validatedRounds, validatedFee);
+      const result = await manager.createRoom(socket.id, wallet, validatedUsername, validatedRounds, validatedFee);
       if (!result.ok) return socket.emit('errorMessage', { message: result.error });
 
       const { room } = result;
@@ -177,7 +229,7 @@ function registerSocketHandlers(io) {
     });
 
     // ── joinRoom ───────────────────────────────────────────────────────────────
-    socket.on('joinRoom', (payload = {}) => {
+    socket.on('joinRoom', async (payload = {}) => {
       const { roomId, wallet, username } = payload;
       console.log(`[Socket] joinRoom — socket: ${socket.id}, roomId: ${JSON.stringify(roomId)}, wallet: ${JSON.stringify(wallet)}`);
 
@@ -189,7 +241,7 @@ function registerSocketHandlers(io) {
       }
 
       const validatedUsername = sanitizeUsername(username, wallet);
-      const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
+      const result = await manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
       if (!result.ok) return socket.emit('errorMessage', { message: result.error });
 
       const { room } = result;
@@ -199,16 +251,16 @@ function registerSocketHandlers(io) {
     });
 
     // ── setRounds ──────────────────────────────────────────────────────────────
-    socket.on('setRounds', (payload = {}) => {
-      const room = manager.getRoomForSocket(socket.id);
+    socket.on('setRounds', async (payload = {}) => {
+      const room = await manager.getRoomForSocket(socket.id);
       if (!room) return socket.emit('errorMessage', { message: 'You are not in a room' });
       room.setRounds(socket.id, payload.rounds);
     });
 
     // ── setReady ───────────────────────────────────────────────────────────────
-    socket.on('setReady', (payload = {}) => {
+    socket.on('setReady', async (payload = {}) => {
       console.log(`[Socket] setReady — socket: ${socket.id}, ready: ${payload.ready}`);
-      const room = manager.getRoomForSocket(socket.id);
+      const room = await manager.getRoomForSocket(socket.id);
       if (!room) {
         console.warn(`[Socket] setReady failed — ${socket.id} not in a room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
@@ -217,9 +269,9 @@ function registerSocketHandlers(io) {
     });
 
     // ── startGame ──────────────────────────────────────────────────────────────
-    socket.on('startGame', () => {
+    socket.on('startGame', async () => {
       console.log(`[Socket] startGame — socket: ${socket.id}`);
-      const room = manager.getRoomForSocket(socket.id);
+      const room = await manager.getRoomForSocket(socket.id);
       if (!room) {
         console.warn(`[Socket] startGame failed — ${socket.id} not in a room`);
         return socket.emit('errorMessage', { message: 'You are not in a room' });
@@ -228,14 +280,17 @@ function registerSocketHandlers(io) {
     });
 
     // ── playerInput ────────────────────────────────────────────────────────────
-    socket.on('playerInput', (payload = {}) => {
-      const room = manager.getRoomForSocket(socket.id);
+    // The ONLY gameplay input the client ever sends. payload.direction is
+    // validated against an enum inside Room.handleInput — never trusted as
+    // position/velocity/anything else.
+    socket.on('playerInput', async (payload = {}) => {
+      const room = await manager.getRoomForSocket(socket.id);
       if (!room) return;
       room.handleInput(socket.id, payload.direction);
     });
 
     // ── playAgain ──────────────────────────────────────────────────────────────
-    socket.on('playAgain', (payload = {}) => {
+    socket.on('playAgain', async (payload = {}) => {
       const { roomId, wallet } = payload;
       console.log(`[Socket] playAgain — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
 
@@ -246,7 +301,7 @@ function registerSocketHandlers(io) {
         return socket.emit('errorMessage', { message: 'Invalid room ID' });
       }
 
-      const result = manager.playAgain(socket.id, wallet);
+      const result = await manager.playAgain(socket.id, wallet);
       if (!result.ok) {
         if (result.error === 'Lobby is full') {
           return socket.emit('lobbyFull', { message: 'Lobby is full' });
@@ -256,11 +311,11 @@ function registerSocketHandlers(io) {
     });
 
     // ── exitMatch ──────────────────────────────────────────────────────────────
-    socket.on('exitMatch', (payload = {}) => {
+    socket.on('exitMatch', async (payload = {}) => {
       const { roomId } = payload;
       console.log(`[Socket] exitMatch — socket: ${socket.id}, roomId: ${roomId}`);
 
-      const result = manager.exitMatch(socket.id);
+      const result = await manager.exitMatch(socket.id);
       if (!result.ok) {
         return socket.emit('errorMessage', { message: result.error ?? 'Could not exit room' });
       }
@@ -271,7 +326,7 @@ function registerSocketHandlers(io) {
     // ── sendInvite ─────────────────────────────────────────────────────────────
     // Payload: { targetWallet?, targetUsername?, roomId, fromWallet, fromUsername }
     // Exactly one of targetWallet / targetUsername must be provided.
-    socket.on('sendInvite', (payload = {}) => {
+    socket.on('sendInvite', async (payload = {}) => {
       const { targetWallet, targetUsername, roomId, fromWallet, fromUsername } = payload;
 
       console.log(
@@ -295,7 +350,7 @@ function registerSocketHandlers(io) {
       if (!roomId || typeof roomId !== 'string') {
         return socket.emit('errorMessage', { message: 'sendInvite: invalid roomId' });
       }
-      const room = manager.getRoom(roomId.toUpperCase());
+      const room = await manager.getRoom(roomId.toUpperCase());
       if (!room) {
         return socket.emit('errorMessage', { message: `Room ${roomId} not found` });
       }
@@ -311,13 +366,13 @@ function registerSocketHandlers(io) {
       }
 
       // ── Sender must be in the room ───────────────────────────────────────────
-      const senderRoom = manager.getRoomForSocket(socket.id);
+      const senderRoom = await manager.getRoomForSocket(socket.id);
       if (!senderRoom || senderRoom.roomId !== room.roomId) {
         return socket.emit('errorMessage', { message: 'You are not in this room' });
       }
 
       // ── Resolve target ───────────────────────────────────────────────────────
-      const target = registry.findTarget(targetWallet, targetUsername);
+      const target = await registry.findTarget(targetWallet, targetUsername);
       if (!target) {
         const identifier = targetWallet ?? targetUsername;
         return socket.emit('errorMessage', { message: `User "${identifier}" is not online` });
@@ -346,12 +401,32 @@ function registerSocketHandlers(io) {
       console.log(
         `[Socket] Invite sent: ${fromWallet} → ${target.wallet} for room ${roomId}`
       );
+
+      // ── Social cross-app push (new) ──────────────────────────────────────────
+      // Everything above is unchanged. This is purely additive: the emit
+      // above only reaches B if they already have a game socket open — this
+      // pushes the same invite to the backend's /social SSE layer so B gets
+      // notified even if they're just browsing the lobby/dashboard with no
+      // game client open at all. Fire-and-forget — notifySocial() never
+      // throws, so a backend hiccup here can never affect the invite above.
+      const hostPlayer = lobbyState.players.find(p => p.socketId === lobbyState.hostId);
+
+      BackendClient.notifySocial('roomInviteReceived', target.wallet, {
+        roomId:       room.roomId,
+        gameType:     'curve_fever',
+        hostWallet:   hostPlayer?.wallet   ?? fromWallet,
+        hostUsername: hostPlayer?.username ?? (fromUsername ?? fromWallet),
+        entryFee:     lobbyState.entryFee,
+        playerCount:  lobbyState.players.length,
+        maxPlayers:   MAX_PLAYERS,
+        expiresAt:    Date.now() + INVITE_EXPIRY_MS,
+      });
     });
 
     // ── acceptInvite ───────────────────────────────────────────────────────────
     // Payload: { roomId, wallet, username? }
     // Identical logic to joinRoom — handled the same way server-side.
-    socket.on('acceptInvite', (payload = {}) => {
+    socket.on('acceptInvite', async (payload = {}) => {
       const { roomId, wallet, username } = payload;
       console.log(`[Socket] acceptInvite — socket: ${socket.id}, roomId: ${roomId}, wallet: ${wallet}`);
 
@@ -363,7 +438,7 @@ function registerSocketHandlers(io) {
       }
 
       const validatedUsername = sanitizeUsername(username, wallet);
-      const result = manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
+      const result = await manager.joinRoom(socket.id, roomId.toUpperCase(), wallet, validatedUsername);
 
       if (!result.ok) {
         // Use lobbyFull for the capacity error, errorMessage for everything else
@@ -382,7 +457,7 @@ function registerSocketHandlers(io) {
     // ── declineInvite ──────────────────────────────────────────────────────────
     // Payload: { roomId, wallet, fromWallet }
     // Notifies the inviter that their invite was declined.
-    socket.on('declineInvite', (payload = {}) => {
+    socket.on('declineInvite', async (payload = {}) => {
       const { roomId, wallet, fromWallet } = payload;
       console.log(`[Socket] declineInvite — ${wallet} declined invite from ${fromWallet} for room ${roomId}`);
 
@@ -391,7 +466,7 @@ function registerSocketHandlers(io) {
       }
 
       // Find the inviter and notify them if still online
-      const inviter = registry.findByWallet(fromWallet);
+      const inviter = await registry.findByWallet(fromWallet);
       if (inviter) {
         io.to(inviter.socketId).emit('inviteDeclined', {
           roomId,
@@ -402,18 +477,21 @@ function registerSocketHandlers(io) {
     });
 
     // ── disconnect ─────────────────────────────────────────────────────────────
-    socket.on('disconnect', (reason) => {
+    socket.on('disconnect', async (reason) => {
       console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
-      registry.remove(socket.id);
-      manager.removePlayer(socket.id);
+      await registry.remove(socket.id);
+      await manager.removePlayer(socket.id);
+      if (socket.data.registeredWallet) {
+        await presenceService.goOffline(socket.data.registeredWallet);
+      }
     });
   });
 
   // ── Periodic stats ─────────────────────────────────────────────────────────
-  setInterval(() => {
-    const rooms   = manager.activeRoomCount;
-    const players = manager.connectedPlayers;
-    const online  = registry.onlineCount;
+  setInterval(async () => {
+    const rooms   = await manager.activeRoomCount();
+    const players = await manager.connectedPlayers();
+    const online  = await presenceService.onlineCount();
     if (rooms > 0 || players > 0 || online > 0) {
       console.log(`[Stats] Rooms: ${rooms} | In-room: ${players} | Online: ${online}`);
     }
