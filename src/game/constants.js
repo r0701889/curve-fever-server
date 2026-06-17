@@ -51,7 +51,7 @@ const PLAYER_SPEED        = PLAYER_SPEED_PPS / TICK_RATE;   // 1.25 px/tick
 const TURN_RATE           = TURN_RATE_RPS    / TICK_RATE;   // 0.0275 rad/tick
 const PLAYER_RADIUS       = 3;
 
-// ─── Trail (classic Curve Fever — permanent, lethal) ───────────────────────────
+// ─── Trail (classic Curve Fever — permanent, lethal, WITH GAPS) ────────────────
 //
 // REVERTED from the fixed-length snake-body system back to classic Curve
 // Fever rules. Each player leaves a trail behind them that PERSISTS for the
@@ -60,14 +60,14 @@ const PLAYER_RADIUS       = 3;
 // per round by Room._startRound(), which re-seeds every player's trail to
 // a single point at their new spawn).
 //
-// this._trails: Map<socketId, Array<{x,y,r}>>
+// this._trails: Map<socketId, Array<{x,y,r,gap?}>>
 //   index 0     = first point laid down this round (at spawn)
 //   last index  = most recent point (just behind the current head)
 //   Grows by one point almost every tick a player is alive and moving.
 //   NEVER shrinks during the round — no trimming, no expiry, no fixed
 //   "bodyLengthPx" target. This is the entire gameplay reversion: the
-//   lethal zone is everywhere the player has ever been this round, not a
-//   sliding window behind the head.
+//   lethal zone is everywhere the player has ever been this round (minus
+//   periodic gaps — see below), not a sliding window behind the head.
 //
 // Self-collision: the points immediately behind the head are always within
 // head-radius of the head itself (continuous movement) and must be skipped,
@@ -75,11 +75,38 @@ const PLAYER_RADIUS       = 3;
 // This window is fixed-size and independent of how long the trail has grown.
 const TRAIL_SELF_SKIP_POINTS = 8;
 
+// ── Trail gaps (classic Curve Fever) ────────────────────────────────────────
+//
+// Periodically, each player's trail generation pauses briefly: the head
+// keeps moving but no trail point is appended (and therefore nothing is
+// lethal or rendered) for that stretch. This produces the classic dashed
+// trail look:  ====  ====  =====  ====
+//
+// Entirely server-authoritative — GameLoop alone decides when a gap starts
+// and ends, per player, on its own random schedule. The client has no input
+// into this and never invents gaps locally; it only ever draws/collides
+// against whatever trail points the server actually sends (and the server
+// never sends points for a gap stretch in the first place).
+//
+// Schedule (per player, independent):
+//   - Solid stretch for TRAIL_GAP_INTERVAL_MIN_MS–TRAIL_GAP_INTERVAL_MAX_MS,
+//     then a gap of TRAIL_GAP_DURATION_MIN_MS–TRAIL_GAP_DURATION_MAX_MS,
+//     then back to a solid stretch, repeating for the whole round.
+//   - Each player rolls their own random next-interval/duration so players'
+//     gaps don't sync up.
+const TRAIL_GAP_INTERVAL_MIN_MS  = 2_000;   // shortest solid stretch before a gap
+const TRAIL_GAP_INTERVAL_MAX_MS  = 5_000;   // longest solid stretch before a gap
+const TRAIL_GAP_DURATION_MIN_MS  = 100;     // shortest gap
+const TRAIL_GAP_DURATION_MAX_MS  = 250;     // longest gap
+
 // Network payload: gameState.players[].trailPoints (bodyPoints is kept as an
 // identical alias for frontend backward compatibility — see GameLoop
 // _buildSnapshot) is decimated for transmission. The server simulates and
 // collides against the FULL, untrimmed trail every tick — only the
-// broadcast is sampled down to keep payload size reasonable.
+// broadcast is sampled down to keep payload size reasonable. Gap stretches
+// are never appended to the trail at all (see GameLoop._step), so the
+// decimation step below naturally never sends an "invisible" gap point —
+// there's nothing there to sample.
 //
 // Because the trail now grows for the whole round instead of being capped
 // at a fixed ~300px window, a flat fixed-stride sample (the old approach)
@@ -232,6 +259,11 @@ module.exports = {
   // Trail (classic, permanent, lethal)
   TRAIL_SELF_SKIP_POINTS,
   TRAIL_POINT_MAX_SENT,
+  // Trail gaps (classic Curve Fever)
+  TRAIL_GAP_INTERVAL_MIN_MS,
+  TRAIL_GAP_INTERVAL_MAX_MS,
+  TRAIL_GAP_DURATION_MIN_MS,
+  TRAIL_GAP_DURATION_MAX_MS,
   // Tick
   TICK_RATE,
   TICK_INTERVAL_MS,
@@ -270,4 +302,3 @@ module.exports = {
   GROWTH_SPEED_PER_ELIMINATION,
   GROWTH_MAX_SPEED,
 };
-

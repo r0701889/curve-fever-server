@@ -8,6 +8,10 @@ const {
   PLAYER_RADIUS,
   TRAIL_SELF_SKIP_POINTS,
   TRAIL_POINT_MAX_SENT,
+  TRAIL_GAP_INTERVAL_MIN_MS,
+  TRAIL_GAP_INTERVAL_MAX_MS,
+  TRAIL_GAP_DURATION_MIN_MS,
+  TRAIL_GAP_DURATION_MAX_MS,
 } = require('./constants');
 
 const { collidesWithWall, collidesWithBody } = require('./collision');
@@ -20,47 +24,83 @@ const { ArenaManager }    = require('./ArenaManager');
  *
  * Runs ONE round. Multi-round orchestration lives in Room.js.
  *
- * ── Trail model (classic Curve Fever — REVERTED from fixed-length snake body) ──
+ * ── Trail model (classic Curve Fever — permanent, gapped) ─────────────────────
  *
- *   Each player leaves a PERMANENT, LETHAL trail behind them as they move.
+ *   Each player leaves a PERMANENT, LETHAL trail behind them as they move,
+ *   broken up by periodic GAPS (see "Trail gaps" below) — the classic
+ *   dashed-line look:  ====  ====  =====  ====
+ *
  *   There is no body-length cap and no trimming — the trail is every point
- *   the player has visited since the start of the current round. The only
- *   thing that clears a trail is a brand-new round starting: Room._startRound()
- *   constructs a fresh GameLoop per round, and _initPlayers() (below) seeds
- *   every player's trail back down to a single point at their new spawn.
+ *   the player has visited since the start of the current round, MINUS the
+ *   stretches that fell inside a gap. The only thing that clears a trail is
+ *   a brand-new round starting: Room._startRound() constructs a fresh
+ *   GameLoop per round, and _initPlayers() (below) seeds every player's
+ *   trail back down to a single point at their new spawn and rolls a fresh
+ *   gap schedule.
  *
  *   this._trails: Map<socketId, Array<{x,y,r}>>
  *     index 0     = first point laid down this round (at spawn)
  *     last index  = most recent point pushed (just behind the current head)
- *     Grows by ~1 point per tick per alive, moving player. NEVER trimmed.
+ *     Grows by ~1 point per tick per alive, moving player — EXCEPT while
+ *     that player is currently inside a gap, during which NO point is
+ *     appended at all. Never trimmed otherwise.
  *
- *   Collision uses the FULL _trails map — every point ever laid this round,
- *   for every player, is live and lethal. This is the entire gameplay
- *   reversion: previously only a sliding window behind the head was lethal
- *   (Slither/Snake-style); now the whole path is (classic Curve Fever).
+ *   Collision uses the FULL _trails map — every point ever laid this round
+ *   (outside of gaps) is live and lethal, for every player. Because gap
+ *   stretches never get appended in the first place, collision code needs
+ *   no gap-specific logic: a head moving through a gap simply finds no
+ *   points there to hit, in its own trail or anyone else's.
+ *
+ * ── Trail gaps (classic Curve Fever — server-authoritative) ───────────────────
+ *
+ *   Each player independently alternates between two phases:
+ *     'solid' — trail is being laid normally. Lasts TRAIL_GAP_INTERVAL_MIN_MS
+ *               to TRAIL_GAP_INTERVAL_MAX_MS (randomised per player, per
+ *               occurrence), then a gap begins.
+ *     'gap'   — trail generation pauses. The player's head keeps moving and
+ *               keeps colliding against the wall and *other* lethal trail
+ *               points exactly as normal, but no new point is appended for
+ *               their own trail, so this stretch is invisible and passable.
+ *               Lasts TRAIL_GAP_DURATION_MIN_MS to TRAIL_GAP_DURATION_MAX_MS,
+ *               then a new solid stretch begins.
+ *
+ *   This scheduling lives entirely in GameLoop (this._gapState, populated in
+ *   _initPlayers and advanced in _step via _advanceGapState). The client has
+ *   no say in when gaps happen and never invents them locally — it only ever
+ *   renders/collides against the trail points the server actually sent, and
+ *   gap stretches were never points to begin with, so there is nothing
+ *   "invisible" being sent over the wire to hide.
  *
  * ── Network payload ──────────────────────────────────────────────────────────
  *
- *   The server simulates and collides against the full untrimmed trail every
- *   tick, but only a decimated sample is broadcast — see _sampleTrailPoints.
- *   Sent as gameState.players[].trailPoints, with players[].bodyPoints kept
- *   as an identical alias so existing Emblem frontend code that already
- *   reads bodyPoints keeps working unmodified. Both fields carry the exact
- *   same sampled array — pick whichever name is clearer going forward.
+ *   The server simulates and collides against the full untrimmed (gapped)
+ *   trail every tick, but only a decimated sample is broadcast — see
+ *   _sampleTrailPoints. Sent as gameState.players[].trailPoints, with
+ *   players[].bodyPoints kept as an identical alias so existing Emblem
+ *   frontend code that already reads bodyPoints keeps working unmodified.
+ *   Both fields carry the exact same sampled array — pick whichever name is
+ *   clearer going forward. Because gap stretches are never stored as points,
+ *   decimation never has anything "invisible" to accidentally include —
+ *   only real, currently-lethal trail segments are ever in the array.
  *
  * ── Collision ────────────────────────────────────────────────────────────────
  *   - Head vs ANY current trail point (self or other), across the player's
  *     ENTIRE trail this round — collidesWithBody, now given the full
- *     unbounded _trails map instead of a fixed-length body map.
+ *     unbounded (gapped) _trails map instead of a fixed-length body map.
  *   - Self-collision skips a small FIXED window of points immediately
  *     behind the head (TRAIL_SELF_SKIP_POINTS) — these are always within
  *     head-radius due to continuous movement and are not real collisions.
  *     This window does NOT grow with the trail.
  *   - Wall / shrink boundary — always lethal; Ghost/Shield do not protect.
+ *     Gaps do NOT protect against the wall either — only against trails.
  *   - Ghost: skips trail-collision entirely (self + others). Wall/shrink
  *     still lethal.
  *   - Shield (stacked counter on the growth map): intercepts trail-collision,
  *     decrements counter, player survives. Does not protect against wall/shrink.
+ *   - Gaps: a head moving through a stretch where ITS OWN past trail has a
+ *     gap is simply not exposed to a collision there (no point exists to
+ *     hit). Gaps never affect collision against OTHER players' (non-gapped)
+ *     trail — only the issuing player's own missing segment is passable.
  *
  * ── Growth (reverted) ────────────────────────────────────────────────────────
  *   There is no body-length/lengthMultiplier mechanic anymore — eliminations
@@ -116,8 +156,15 @@ class GameLoop {
     this._running    = false;
 
     this._players = new Map();
-    this._trails  = new Map();  // socketId -> [{x,y,r}], permanent for the round
+    this._trails  = new Map();  // socketId -> [{x,y,r}], permanent for the round (gapped)
     this._inputs  = new Map();
+
+    // Per-player trail-gap scheduler state. socketId -> {
+    //   phase: 'solid' | 'gap',
+    //   phaseEndsAt: unix ms — when the current phase ends and the other begins
+    // }
+    // Populated in _initPlayers(); advanced once per tick in _advanceGapState().
+    this._gapState = new Map();
 
     // Arena manager — owns shrink cycle and lethal bounds
     this._arena = new ArenaManager({
@@ -146,6 +193,9 @@ class GameLoop {
     this._players.clear();
     this._trails.clear();
     this._inputs.clear();
+    this._gapState.clear();
+
+    const now = Date.now();
 
     this._playerIds.forEach((id, idx) => {
       const spawn = spawns[idx];
@@ -164,6 +214,14 @@ class GameLoop {
       // round starts every player's trail back down to this one point.
       this._trails.set(id, [{ x: spawn.x, y: spawn.y, r: PLAYER_RADIUS }]);
       this._inputs.set(id, 'neutral');
+
+      // Roll an independent first "solid" stretch for this player so gaps
+      // across the room don't sync up. Every player starts in 'solid' —
+      // there's no gap right at spawn.
+      this._gapState.set(id, {
+        phase:       'solid',
+        phaseEndsAt: now + this._randomSolidDurationMs(),
+      });
     });
   }
 
@@ -233,7 +291,8 @@ class GameLoop {
       const newY = player.y + Math.sin(player.angle) * speed;
 
       // 5. Wall/shrink-boundary collision — uses current (possibly shrunken)
-      //    arena bounds. Always lethal — Ghost and Shield do NOT protect.
+      //    arena bounds. Always lethal — Ghost, Shield, and trail-gaps do
+      //    NOT protect against this.
       if (collidesWithWall(newX, newY, this._arena.getCurrentBounds())) {
         this._killPlayer(id, 'wall');
         continue;
@@ -241,7 +300,10 @@ class GameLoop {
 
       // 6. Trail collision — Ghost skips entirely (self + others),
       //    Shield (stacked counter) absorbs one hit against any trail.
-      //    Checked against the FULL, permanent trail map — classic rules.
+      //    Checked against the FULL, permanent (gapped) trail map —
+      //    classic rules. Gap stretches were never appended as points, so
+      //    a head moving through one of its own gaps naturally has nothing
+      //    to collide with there — no extra branching needed here.
       if (!this._pum.hasGhost(id)) {
         if (collidesWithBody(newX, newY, this._trails, id)) {
           if (this._consumeShield(id)) {
@@ -258,14 +320,20 @@ class GameLoop {
         }
       }
 
-      // 7. Commit movement
+      // 7. Commit movement — always happens, gap or not. The head keeps
+      //    moving through a gap exactly like normal; only step 8 (laying
+      //    a trail point) is skipped while gapped.
       player.x = newX;
       player.y = newY;
 
-      // 8. Append trail point. Never trimmed — this is the permanent,
-      //    lethal trail. Radius reflects Fat/Tiny Trail if active.
-      const pointR = this._pum.getTrailRadius(id, PLAYER_RADIUS);
-      this._pushTrailPoint(id, newX, newY, pointR);
+      // 8. Advance this player's gap schedule and, if currently solid,
+      //    append a trail point. Never trimmed — this is the permanent,
+      //    lethal (gapped) trail. Radius reflects Fat/Tiny Trail if active.
+      const inGap = this._advanceGapState(id);
+      if (!inGap) {
+        const pointR = this._pum.getTrailRadius(id, PLAYER_RADIUS);
+        this._pushTrailPoint(id, newX, newY, pointR);
+      }
     }
 
     // 9. Check round end condition
@@ -279,11 +347,54 @@ class GameLoop {
     this._onGameState(this._buildSnapshot());
   }
 
+  // ─── Trail gap helpers ────────────────────────────────────────────────────────
+
+  _randomSolidDurationMs() {
+    return TRAIL_GAP_INTERVAL_MIN_MS +
+      Math.random() * (TRAIL_GAP_INTERVAL_MAX_MS - TRAIL_GAP_INTERVAL_MIN_MS);
+  }
+
+  _randomGapDurationMs() {
+    return TRAIL_GAP_DURATION_MIN_MS +
+      Math.random() * (TRAIL_GAP_DURATION_MAX_MS - TRAIL_GAP_DURATION_MIN_MS);
+  }
+
+  /**
+   * Advance this player's solid/gap schedule by one tick and report whether
+   * they are CURRENTLY in a gap (i.e. whether the trail point about to be
+   * computed for this tick should be skipped).
+   *
+   * Server-authoritative and entirely self-contained: the only inputs are
+   * Date.now() and this player's own previous phase/timer — nothing the
+   * client sends has any influence here.
+   *
+   * @param {string} socketId
+   * @returns {boolean} true if currently in a gap (skip laying a point)
+   */
+  _advanceGapState(socketId) {
+    const state = this._gapState.get(socketId);
+    if (!state) return false; // defensive — should always exist post-_initPlayers
+
+    const now = Date.now();
+    if (now >= state.phaseEndsAt) {
+      if (state.phase === 'solid') {
+        state.phase       = 'gap';
+        state.phaseEndsAt = now + this._randomGapDurationMs();
+      } else {
+        state.phase       = 'solid';
+        state.phaseEndsAt = now + this._randomSolidDurationMs();
+      }
+    }
+
+    return state.phase === 'gap';
+  }
+
   // ─── Trail helpers ───────────────────────────────────────────────────────────
 
   /**
    * Append a new point to the trail. Classic Curve Fever — no trimming, no
-   * length cap, no expiry. The trail simply grows for the entire round.
+   * length cap, no expiry. The trail simply grows for the entire round,
+   * except during a gap stretch, when _step skips calling this entirely.
    */
   _pushTrailPoint(socketId, x, y, r) {
     const trail = this._trails.get(socketId);
@@ -336,6 +447,7 @@ class GameLoop {
    * Strategy: nearest trail point within (headRadius + pointRadius) wins.
    * Self-trail SKIP applies (same fixed window as collidesWithBody) — this
    * is checked against the player's ENTIRE trail this round, not a window.
+   * Gap stretches contain no points, so they're naturally never considered.
    */
   _findBodyOwner(x, y, victimId) {
     let bestOwner = null;
@@ -400,10 +512,16 @@ class GameLoop {
   }
 
   /**
-   * Decimate a player's current (full, permanent) trail for network
+   * Decimate a player's current (full, permanent, gapped) trail for network
    * transmission. The server simulates and collides against every point
-   * ever laid this round; clients only need enough points to draw the
-   * trail smoothly.
+   * ever laid this round (minus gaps); clients only need enough points to
+   * draw the trail smoothly.
+   *
+   * Because gap stretches were never appended as points in the first place,
+   * this function has nothing extra to filter — every point already in the
+   * array is real, currently-visible/lethal trail, and decimating it simply
+   * thins out dense stretches while leaving the dash pattern's actual gaps
+   * as the natural absence of points they always were.
    *
    * Unlike the old fixed-length-body sampler (which used a flat fixed
    * stride because the body was capped at a small, constant length), the
@@ -445,6 +563,8 @@ class GameLoop {
     for (const [, p] of this._players) {
       const growth = this._growth?.get(p.id);
       const lengthMultiplier = growth?.lengthMultiplier ?? 1.0;
+      // Only ever contains points from solid stretches — gap stretches were
+      // never appended, so there is nothing "invisible" to filter out here.
       const sampledTrail = this._sampleTrailPoints(this._trails.get(p.id) ?? []);
       players.push({
         id:                p.id,
@@ -458,10 +578,15 @@ class GameLoop {
         // at a constant 1.0 purely for frontend backward compatibility —
         // never collision/render relevant, never changes.
         lengthMultiplier,
-        // Permanent, lethal trail for this round — use for collision and
-        // rendering. trailPoints is the new, clearer name; bodyPoints is
+        // Permanent, lethal, gapped trail for this round — use for collision
+        // and rendering. trailPoints is the new, clearer name; bodyPoints is
         // kept as an identical alias so existing frontend code that reads
         // bodyPoints (from the snake-body era) keeps working unmodified.
+        // Gaps in the dashed line are simply where consecutive points are
+        // far apart relative to PLAYER_SPEED — the client should NOT draw a
+        // connecting segment between two points whose distance exceeds a
+        // normal per-tick step, the same way it already must not draw across
+        // a brand-new round's reset point.
         trailPoints:       sampledTrail,
         bodyPoints:        sampledTrail,
         activePowerups:    this._pum.getActivePowerUpsArray(p.id),
