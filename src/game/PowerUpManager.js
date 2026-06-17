@@ -21,34 +21,6 @@ const {
 
 const TOTAL_WEIGHT = POWERUP_WEIGHTS.reduce((s, e) => s + e.weight, 0);
 
-/**
- * PowerUpManager
- *
- * Server-authoritative. Owns:
- *   - Map power-up spawn / expire lifecycle (within ArenaManager.current bounds)
- *   - Per-player ACTIVE power-ups (a player can have multiple at once)
- *   - Collection detection (called each tick by GameLoop)
- *   - Effect queries (GameLoop asks "what speed multiplier does player X have?")
- *
- * Multi-concurrent semantics:
- *   - Speed modifiers (NITRO, SPEED_BOOST) are mutually exclusive — latest wins.
- *   - Trail-radius modifiers (FAT_TRAIL, TINY_TRAIL) are mutually exclusive — latest wins.
- *   - GHOST stacks alongside any of the above (you can be Ghost + Nitro).
- *   - SHIELD and LENGTH_BOOST do NOT live here — they modify growth directly.
- *     PowerUpManager just emits the "collected" event for them.
- *
- * Does NOT know about Socket.io — uses callbacks for output.
- *
- * Callbacks:
- *   onPowerUpsUpdate(powerUps)             — map changed (spawn/collect/expire)
- *   onPowerUpCollected(socketId, type, ms) — player picked up a power-up
- *   onPowerUpExpired(socketId, type)       — active power-up timer ran out
- *   onPowerUpUsed(socketId, type)          — shield consumed on body hit
- *
- * Dependencies:
- *   arena   — ArenaManager (for spawn bounds)
- *   growth  — Map<socketId, growthData> (for player-clearance check during spawn)
- */
 class PowerUpManager {
   constructor({ onPowerUpsUpdate, onPowerUpCollected, onPowerUpExpired, onPowerUpUsed, arena, growth }) {
     this._onPowerUpsUpdate   = onPowerUpsUpdate;
@@ -58,21 +30,14 @@ class PowerUpManager {
     this._arena              = arena ?? null;
     this._growth             = growth ?? null;
 
-    // Power-ups currently on the map: id → { id, type, x, y, spawnedAt, expiresAt }
     this._mapPowerUps = new Map();
-
-    // Active power-ups per player: socketId → Map<type, { type, activatedAt, expiresAt }>
-    // Using a per-player Map keyed by type lets us cleanly enforce "latest wins
-    // within a category" while permitting cross-category stacking.
     this._playerActive = new Map();
 
     this._spawnTimer    = null;
     this._running       = false;
-    this._currentBodies = null;  // socketId -> current snake body points
+    this._currentBodies = null;
     this._currentPlayers = null;
   }
-
-  // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
   start() {
     this._running = true;
@@ -93,8 +58,6 @@ class PowerUpManager {
     this._playerActive.clear();
   }
 
-  // ─── Tick ────────────────────────────────────────────────────────────────────
-
   tick(players) {
     if (!this._running) return;
     this._currentPlayers = players;
@@ -102,7 +65,6 @@ class PowerUpManager {
     const now = Date.now();
     let mapChanged = false;
 
-    // 1. Expire map power-ups
     for (const [id, pu] of this._mapPowerUps) {
       if (now >= pu.expiresAt) {
         this._mapPowerUps.delete(id);
@@ -111,7 +73,6 @@ class PowerUpManager {
       }
     }
 
-    // 2. Expire active player power-ups (per-type)
     for (const [socketId, typesMap] of this._playerActive) {
       for (const [type, active] of typesMap) {
         if (active.expiresAt !== null && now >= active.expiresAt) {
@@ -123,7 +84,6 @@ class PowerUpManager {
       if (typesMap.size === 0) this._playerActive.delete(socketId);
     }
 
-    // 3. Collection detection
     if (this._mapPowerUps.size > 0) {
       for (const [socketId, player] of players) {
         if (!player.alive) continue;
@@ -142,32 +102,23 @@ class PowerUpManager {
     if (mapChanged) this._emitMapUpdate();
   }
 
-  // ─── Collection ──────────────────────────────────────────────────────────────
-
   _collect(socketId, puId, pu) {
     this._mapPowerUps.delete(puId);
 
     const duration = POWERUP_DURATION_MS[pu.type];
 
-    // SHIELD and LENGTH_BOOST don't become "active" power-ups —
-    // they modify growth state. GameLoop's collected-wrapper handles that.
-    // Just emit the event so the UI can show the pickup notification.
-    if (pu.type === POWERUP_TYPES.SHIELD || pu.type === POWERUP_TYPES.LENGTH_BOOST) {
-      console.log(`[PowerUp] ${socketId} collected ${pu.type} (counter/growth — no active timer)`);
+    if (pu.type === POWERUP_TYPES.SHIELD) {
+      console.log(`[PowerUp] ${socketId} collected ${pu.type} (counter/growth -- no active timer)`);
       this._onPowerUpCollected(socketId, pu.type, duration);
       return;
     }
 
-    // Multi-active model: keep a per-type record per player.
-    // Replacing same-type (a 2nd nitro pickup) extends the timer.
-    // Cross-category power-ups (ghost + nitro) coexist.
     const entry = {
       type:        pu.type,
       activatedAt: Date.now(),
       expiresAt:   duration !== null ? Date.now() + duration : null,
     };
 
-    // Enforce category exclusivity: same speed-category replaces, same trail-category replaces
     this._enforceCategoryExclusivity(socketId, pu.type);
 
     let typesMap = this._playerActive.get(socketId);
@@ -181,10 +132,6 @@ class PowerUpManager {
     this._onPowerUpCollected(socketId, pu.type, duration);
   }
 
-  /**
-   * If picking up `newType` conflicts with an existing active type in the same
-   * category, remove the old one and emit expired (so the UI can clear the icon).
-   */
   _enforceCategoryExclusivity(socketId, newType) {
     const cat = categoryOf(newType);
     if (!cat) return;
@@ -200,11 +147,6 @@ class PowerUpManager {
     }
   }
 
-  // ─── Shield consumption ───────────────────────────────────────────────────────
-  // Legacy method — kept for backward compatibility. Real shield consumption
-  // happens in GameLoop._consumeShield() against growth.shieldCount.
-  // This method is no longer called from GameLoop but is exported for tests.
-
   consumeShield(socketId) {
     if (!this._growth) return false;
     const g = this._growth.get(socketId);
@@ -214,13 +156,6 @@ class PowerUpManager {
     return true;
   }
 
-  // ─── Effect queries (per tick) ───────────────────────────────────────────────
-
-  /**
-   * Returns the speed multiplier from active power-ups (1.0 if none).
-   * NITRO takes priority over SPEED_BOOST if somehow both are active
-   * (shouldn't happen due to category exclusivity, but defensive).
-   */
   getSpeedMultiplier(socketId) {
     const typesMap = this._playerActive.get(socketId);
     if (!typesMap) return 1.0;
@@ -229,7 +164,6 @@ class PowerUpManager {
     return 1.0;
   }
 
-  /** Returns the snake body-point radius for a player (baseRadius if no effect) */
   getTrailRadius(socketId, baseRadius) {
     const typesMap = this._playerActive.get(socketId);
     if (!typesMap) return baseRadius;
@@ -248,14 +182,9 @@ class PowerUpManager {
     return (g?.shieldCount ?? 0) > 0;
   }
 
-  /**
-   * Legacy single-active accessor — returns the "most interesting" active
-   * power-up for the scoreboard. Prefer getActivePowerUpsArray for full state.
-   */
   getActivePowerUp(socketId) {
     const typesMap = this._playerActive.get(socketId);
     if (!typesMap || typesMap.size === 0) return null;
-    // Return the most recently activated one
     let latest = null;
     for (const entry of typesMap.values()) {
       if (!latest || entry.activatedAt > latest.activatedAt) latest = entry;
@@ -267,12 +196,6 @@ class PowerUpManager {
     return { type: latest.type, remainingMs: remaining };
   }
 
-  /**
-   * Returns ALL active power-ups for a player.
-   * Used in gameState.players[].activePowerups for the new UI.
-   *
-   * @returns {Array<{type, expiresAt}>}
-   */
   getActivePowerUpsArray(socketId) {
     const typesMap = this._playerActive.get(socketId);
     if (!typesMap || typesMap.size === 0) return [];
@@ -292,8 +215,6 @@ class PowerUpManager {
     }));
   }
 
-  // ─── Spawn ────────────────────────────────────────────────────────────────────
-
   _scheduleNextSpawn() {
     if (!this._running) return;
     const delay = POWERUP_SPAWN_MIN_MS +
@@ -305,7 +226,7 @@ class PowerUpManager {
     if (!this._running) return;
 
     if (this._mapPowerUps.size >= POWERUP_MAX_ON_MAP) {
-      console.log(`[PowerUp] Spawn delayed — max ${POWERUP_MAX_ON_MAP} on map`);
+      console.log(`[PowerUp] Spawn delayed -- max ${POWERUP_MAX_ON_MAP} on map`);
       this._spawnTimer = setTimeout(() => this._trySpawn(), 2_000);
       return;
     }
@@ -337,15 +258,10 @@ class PowerUpManager {
     this._currentBodies = bodies;
   }
 
-  /**
-   * Find a safe spawn position inside the CURRENT arena bounds (shrinks!).
-   * Avoids walls, current snake bodies, and other alive players' heads.
-   */
   _findSafePosition() {
-    // Spawn bounds come from the current arena (shrinks!)
     const bounds = this._arena
       ? this._arena.getCurrentBounds()
-      : { x: 0, y: 0, width: 1200, height: 900 };  // fallback
+      : { x: 0, y: 0, width: 1200, height: 900 };
 
     const margin    = POWERUP_SPAWN_WALL_MARGIN;
     const clearance = POWERUP_SPAWN_TRAIL_CLEARANCE;
@@ -362,7 +278,6 @@ class PowerUpManager {
       const x = minX + Math.random() * (maxX - minX);
       const y = minY + Math.random() * (maxY - minY);
 
-      // Player clearance — don't spawn on top of someone
       if (this._currentPlayers) {
         let tooClose = false;
         for (const [, p] of this._currentPlayers) {
@@ -377,7 +292,6 @@ class PowerUpManager {
         if (tooClose) continue;
       }
 
-      // Body clearance — don't spawn on top of any current snake body
       if (this._currentBodies) {
         let safe = true;
         outer:
@@ -413,17 +327,6 @@ class PowerUpManager {
   }
 }
 
-// ─── Category helpers ────────────────────────────────────────────────────────────
-
-/**
- * Two active power-ups are MUTUALLY EXCLUSIVE if they share a category.
- * Otherwise they can stack.
- *
- * Categories:
- *   'speed'  — NITRO, SPEED_BOOST     (only one active at a time)
- *   'trail'  — FAT_TRAIL, TINY_TRAIL  (only one active at a time)
- *   null     — independent (GHOST stands alone — never conflicts)
- */
 function categoryOf(type) {
   if (type === POWERUP_TYPES.NITRO || type === POWERUP_TYPES.SPEED_BOOST) return 'speed';
   if (type === POWERUP_TYPES.FAT_TRAIL || type === POWERUP_TYPES.TINY_TRAIL) return 'trail';

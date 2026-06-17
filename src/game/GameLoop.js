@@ -6,9 +6,8 @@ const {
   TICK_INTERVAL_MS,
   PLAYER_COLORS,
   PLAYER_RADIUS,
-  BASE_BODY_LENGTH_PX,
-  BODY_POINT_SAMPLE_STRIDE,
-  BODY_POINT_MAX_SENT,
+  TRAIL_SELF_SKIP_POINTS,
+  TRAIL_POINT_MAX_SENT,
 } = require('./constants');
 
 const { collidesWithWall, collidesWithBody } = require('./collision');
@@ -21,57 +20,57 @@ const { ArenaManager }    = require('./ArenaManager');
  *
  * Runs ONE round. Multi-round orchestration lives in Room.js.
  *
- * ── Snake body model (replaces permanent trails) ────────────────────────────────
+ * ── Trail model (classic Curve Fever — REVERTED from fixed-length snake body) ──
  *
- *   Each player is a fixed-length snake body. There is NO permanent trail —
- *   the tail is continuously trimmed so the head-to-tail PATH DISTANCE stays
- *   close to that player's `bodyLengthPx`.
+ *   Each player leaves a PERMANENT, LETHAL trail behind them as they move.
+ *   There is no body-length cap and no trimming — the trail is every point
+ *   the player has visited since the start of the current round. The only
+ *   thing that clears a trail is a brand-new round starting: Room._startRound()
+ *   constructs a fresh GameLoop per round, and _initPlayers() (below) seeds
+ *   every player's trail back down to a single point at their new spawn.
  *
- *   this._bodies: Map<socketId, Array<{x,y,r}>>
- *     index 0     = tail (oldest point still part of the body)
+ *   this._trails: Map<socketId, Array<{x,y,r}>>
+ *     index 0     = first point laid down this round (at spawn)
  *     last index  = most recent point pushed (just behind the current head)
+ *     Grows by ~1 point per tick per alive, moving player. NEVER trimmed.
  *
- *   this._bodyLen: Map<socketId, number>  — running total path-distance of
- *     the body array, maintained incrementally (O(1) amortized per tick):
- *       +new segment length when a point is pushed
- *       -trimmed segment lengths when tail points are removed
+ *   Collision uses the FULL _trails map — every point ever laid this round,
+ *   for every player, is live and lethal. This is the entire gameplay
+ *   reversion: previously only a sliding window behind the head was lethal
+ *   (Slither/Snake-style); now the whole path is (classic Curve Fever).
  *
- *   Trimming each tick:
- *     1. push new point, bodyLen += segment distance to previous point
- *     2. while bodyLen > targetBodyLengthPx AND body.length > 1:
- *          shift tail point, bodyLen -= distance(tail, newTail)
+ * ── Network payload ──────────────────────────────────────────────────────────
  *
- *   targetBodyLengthPx = BASE_BODY_LENGTH_PX * lengthMultiplier (from growth
- *   map). Changing lengthMultiplier doesn't truncate/extend instantly — the
- *   body naturally converges to the new target over the next few ticks
- *   (the per-tick segment is ~1.25px, negligible relative to 120px+ bodies).
+ *   The server simulates and collides against the full untrimmed trail every
+ *   tick, but only a decimated sample is broadcast — see _sampleTrailPoints.
+ *   Sent as gameState.players[].trailPoints, with players[].bodyPoints kept
+ *   as an identical alias so existing Emblem frontend code that already
+ *   reads bodyPoints keeps working unmodified. Both fields carry the exact
+ *   same sampled array — pick whichever name is clearer going forward.
  *
- * Collision:
- *   - Head vs ANY current body point (self or other) — collidesWithBody.
- *   - Self-collision skips a small FIXED window of points immediately behind
- *     the head (BODY_SELF_SKIP_POINTS) — independent of bodyLengthPx/growth.
- *   - Wall/shrink boundary — always lethal, Ghost/Shield do not protect.
- *   - Ghost: skips body-collision check entirely (self + others). Wall/shrink
+ * ── Collision ────────────────────────────────────────────────────────────────
+ *   - Head vs ANY current trail point (self or other), across the player's
+ *     ENTIRE trail this round — collidesWithBody, now given the full
+ *     unbounded _trails map instead of a fixed-length body map.
+ *   - Self-collision skips a small FIXED window of points immediately
+ *     behind the head (TRAIL_SELF_SKIP_POINTS) — these are always within
+ *     head-radius due to continuous movement and are not real collisions.
+ *     This window does NOT grow with the trail.
+ *   - Wall / shrink boundary — always lethal; Ghost/Shield do not protect.
+ *   - Ghost: skips trail-collision entirely (self + others). Wall/shrink
  *     still lethal.
- *   - Shield (stacked counter on growth map): intercepts body-collision,
+ *   - Shield (stacked counter on the growth map): intercepts trail-collision,
  *     decrements counter, player survives. Does not protect against wall/shrink.
  *
- * Arena integration: unchanged — see ArenaManager. Wall collision uses
- * ArenaManager.current bounds, shrinking moves the lethal boundary inward.
+ * ── Growth (reverted) ────────────────────────────────────────────────────────
+ *   There is no body-length/lengthMultiplier mechanic anymore — eliminations
+ *   only grant a small permanent speedMultiplier bonus (kept, classic-feeling
+ *   kill reward). lengthMultiplier is still present on the shared growth
+ *   record (Room._ensureGrowth seeds it at 1.0) purely so any frontend code
+ *   reading scoreboard.lengthMultiplier doesn't break; it never changes and
+ *   is never read for collision or trail-radius purposes here.
  *
- * Power-up integration: unchanged — PowerUpManager owned here, spawn bounds
- * from ArenaManager.current, Fat/Tiny Trail set per-point `r` on new body
- * points (same as before, just on _bodies instead of _trails).
- *
- * Growth integration:
- *   - lengthMultiplier drives BOTH body-point radius (visual thickness, as
- *     before) AND targetBodyLengthPx (NEW — snake gets longer too).
- *   - Length Boost (+0.20) / elimination (+0.10) to lengthMultiplier, capped
- *     at GROWTH_MAX_LENGTH (== MAX_BODY_LENGTH_MULTIPLIER, 2.5x).
- *   - speedMultiplier unchanged (movement speed only).
- *   - Shield counter unchanged.
- *
- * Callbacks:
+ * ── Callbacks ────────────────────────────────────────────────────────────────
  *   onGameState(snapshot)
  *   onPlayerDied(id, wallet, reason)
  *   onRoundEnded(winnerId, winnerWallet)
@@ -117,8 +116,7 @@ class GameLoop {
     this._running    = false;
 
     this._players = new Map();
-    this._bodies  = new Map();  // socketId -> [{x,y,r}], index 0 = tail
-    this._bodyLen = new Map();  // socketId -> current path-distance of body
+    this._trails  = new Map();  // socketId -> [{x,y,r}], permanent for the round
     this._inputs  = new Map();
 
     // Arena manager — owns shrink cycle and lethal bounds
@@ -146,8 +144,7 @@ class GameLoop {
   _initPlayers() {
     const spawns = generateSpawns(this._playerIds.length, this._arena.getCurrentBounds());
     this._players.clear();
-    this._bodies.clear();
-    this._bodyLen.clear();
+    this._trails.clear();
     this._inputs.clear();
 
     this._playerIds.forEach((id, idx) => {
@@ -161,10 +158,11 @@ class GameLoop {
         angle:  spawn.angle,
         alive:  true,
       });
-      // Seed the body with a single point at the spawn position so
-      // collision/snapshot code always has at least one point to read.
-      this._bodies.set(id, [{ x: spawn.x, y: spawn.y, r: PLAYER_RADIUS }]);
-      this._bodyLen.set(id, 0);
+      // Seed the trail with a single point at the spawn position. This is
+      // also what makes "new round clears trails" work: GameLoop is
+      // reconstructed fresh per round by Room._startRound(), so every
+      // round starts every player's trail back down to this one point.
+      this._trails.set(id, [{ x: spawn.x, y: spawn.y, r: PLAYER_RADIUS }]);
       this._inputs.set(id, 'neutral');
     });
   }
@@ -214,7 +212,7 @@ class GameLoop {
 
     // 2. Power-up manager tick — expire map PUs, expire player PUs, collect
     this._pum.tick(this._players);
-    this._pum.triggerSpawnCheck(this._bodies);
+    this._pum.triggerSpawnCheck(this._trails);
 
     const aliveBefore = [];
 
@@ -241,18 +239,19 @@ class GameLoop {
         continue;
       }
 
-      // 6. Body collision — Ghost skips entirely (self + others),
-      //    Shield (stacked counter) absorbs one hit against any body.
+      // 6. Trail collision — Ghost skips entirely (self + others),
+      //    Shield (stacked counter) absorbs one hit against any trail.
+      //    Checked against the FULL, permanent trail map — classic rules.
       if (!this._pum.hasGhost(id)) {
-        if (collidesWithBody(newX, newY, this._bodies, id)) {
+        if (collidesWithBody(newX, newY, this._trails, id)) {
           if (this._consumeShield(id)) {
             // Shield absorbed the hit — player survives, no elimination credit
           } else {
-            // Body hit kills — attribute elimination credit to the body's owner
-            const bodyOwner = this._findBodyOwner(newX, newY, id);
+            // Trail hit kills — attribute elimination credit to the trail's owner
+            const trailOwner = this._findBodyOwner(newX, newY, id);
             this._killPlayer(id, 'trail');
-            if (bodyOwner && bodyOwner !== id) {
-              this._creditElimination(bodyOwner);
+            if (trailOwner && trailOwner !== id) {
+              this._creditElimination(trailOwner);
             }
             continue;
           }
@@ -263,11 +262,10 @@ class GameLoop {
       player.x = newX;
       player.y = newY;
 
-      // 8. Append body point + trim tail to maintain fixed body length.
-      //    Radius reflects both Fat/Tiny Trail AND growth length.
-      const baseR  = PLAYER_RADIUS * this._getGrowthLength(id);
-      const pointR = this._pum.getTrailRadius(id, baseR);
-      this._pushBodyPoint(id, newX, newY, pointR);
+      // 8. Append trail point. Never trimmed — this is the permanent,
+      //    lethal trail. Radius reflects Fat/Tiny Trail if active.
+      const pointR = this._pum.getTrailRadius(id, PLAYER_RADIUS);
+      this._pushTrailPoint(id, newX, newY, pointR);
     }
 
     // 9. Check round end condition
@@ -281,49 +279,18 @@ class GameLoop {
     this._onGameState(this._buildSnapshot());
   }
 
-  // ─── Snake body helpers ─────────────────────────────────────────────────────
+  // ─── Trail helpers ───────────────────────────────────────────────────────────
 
   /**
-   * Append a new point to the head end of the body, then trim from the tail
-   * until the total path-distance is back at-or-below targetBodyLengthPx.
-   *
-   * Distance-based trimming: head-to-tail PATH DISTANCE stays close to
-   * targetBodyLengthPx (not point count). targetBodyLengthPx is derived from
-   * the player's current lengthMultiplier, so growth (Length Boost /
-   * elimination) naturally lengthens the body over the next few ticks.
+   * Append a new point to the trail. Classic Curve Fever — no trimming, no
+   * length cap, no expiry. The trail simply grows for the entire round.
    */
-  _pushBodyPoint(socketId, x, y, r) {
-    const body = this._bodies.get(socketId);
-    const prev = body[body.length - 1];
-
-    const segLen = Math.hypot(x - prev.x, y - prev.y);
-    body.push({ x, y, r });
-    this._bodyLen.set(socketId, this._bodyLen.get(socketId) + segLen);
-
-    const targetLen = BASE_BODY_LENGTH_PX * this._getGrowthLength(socketId);
-
-    let len = this._bodyLen.get(socketId);
-    while (len > targetLen && body.length > 1) {
-      const tail     = body[0];
-      const nextTail = body[1];
-      const trimSeg  = Math.hypot(nextTail.x - tail.x, nextTail.y - tail.y);
-
-      // Don't overshoot — if removing this segment would drop us below the
-      // target, stop (keeps the body close to, not under, the target length).
-      if (len - trimSeg < targetLen) break;
-
-      body.shift();
-      len -= trimSeg;
-    }
-    this._bodyLen.set(socketId, len);
+  _pushTrailPoint(socketId, x, y, r) {
+    const trail = this._trails.get(socketId);
+    trail.push({ x, y, r });
   }
 
   // ─── Growth helpers ──────────────────────────────────────────────────────────
-
-  _getGrowthLength(socketId) {
-    const g = this._growth?.get(socketId);
-    return g?.lengthMultiplier ?? 1.0;
-  }
 
   _getGrowthSpeed(socketId) {
     const g = this._growth?.get(socketId);
@@ -344,46 +311,43 @@ class GameLoop {
   }
 
   /**
-   * Award an elimination to the killed body's owner.
-   * Reads caps from constants so growth never exceeds limits.
-   * +0.10 lengthMultiplier (→ +10% bodyLengthPx) and +0.05 speedMultiplier,
-   * both capped at GROWTH_MAX_LENGTH / GROWTH_MAX_SPEED.
+   * Award an elimination to the trail owner whose trail killed someone.
+   * Classic-mode growth is speed-only — there is no body length left to
+   * grow, so only speedMultiplier is incremented (capped at GROWTH_MAX_SPEED).
    */
   _creditElimination(socketId) {
     if (!this._growth) return;
-    const { GROWTH_PER_ELIMINATION, GROWTH_SPEED_PER_ELIMINATION, GROWTH_MAX_LENGTH, GROWTH_MAX_SPEED } =
-      require('./constants');
+    const { GROWTH_SPEED_PER_ELIMINATION, GROWTH_MAX_SPEED } = require('./constants');
 
     const g = this._growth.get(socketId);
     if (!g) return;
 
-    g.lengthMultiplier = Math.min(GROWTH_MAX_LENGTH, g.lengthMultiplier + GROWTH_PER_ELIMINATION);
-    g.speedMultiplier  = Math.min(GROWTH_MAX_SPEED,  g.speedMultiplier  + GROWTH_SPEED_PER_ELIMINATION);
-    g.eliminations    += 1;
+    g.speedMultiplier = Math.min(GROWTH_MAX_SPEED, g.speedMultiplier + GROWTH_SPEED_PER_ELIMINATION);
+    g.eliminations   += 1;
 
-    console.log(`[GameLoop] Elimination credit → ${socketId}: lengthMult=${g.lengthMultiplier.toFixed(2)}, speedMult=${g.speedMultiplier.toFixed(2)}, kills=${g.eliminations}`);
+    console.log(`[GameLoop] Elimination credit → ${socketId}: speedMult=${g.speedMultiplier.toFixed(2)}, kills=${g.eliminations}`);
     this._onPlayerGrowth(socketId, { ...g });
   }
 
   /**
-   * Find which player's CURRENT body killed the head at (x, y).
+   * Find which player's trail killed the head at (x, y).
    * Returns the owner socketId, or null if no clear attribution.
    *
-   * Strategy: nearest body point within (headRadius + pointRadius) wins.
-   * Self-body SKIP applies (same fixed window as collidesWithBody).
+   * Strategy: nearest trail point within (headRadius + pointRadius) wins.
+   * Self-trail SKIP applies (same fixed window as collidesWithBody) — this
+   * is checked against the player's ENTIRE trail this round, not a window.
    */
   _findBodyOwner(x, y, victimId) {
-    const { BODY_SELF_SKIP_POINTS } = require('./constants');
     let bestOwner = null;
     let bestDistSq = Infinity;
 
-    for (const [ownerId, body] of this._bodies) {
+    for (const [ownerId, trail] of this._trails) {
       const limit = ownerId === victimId
-        ? Math.max(0, body.length - BODY_SELF_SKIP_POINTS)
-        : body.length;
+        ? Math.max(0, trail.length - TRAIL_SELF_SKIP_POINTS)
+        : trail.length;
 
       for (let i = 0; i < limit; i++) {
-        const pt = body[i];
+        const pt = trail[i];
         const dx = x - pt.x;
         const dy = y - pt.y;
         const d2 = dx * dx + dy * dy;
@@ -397,29 +361,19 @@ class GameLoop {
   }
 
   /**
-   * Wraps the PowerUpManager's collected callback to handle SHIELD and
-   * LENGTH_BOOST specially: they don't become "active" power-ups, they
-   * modify the player's growth record directly.
+   * Wraps the PowerUpManager's collected callback to handle SHIELD specially:
+   * it doesn't become an "active" timed power-up, it modifies the player's
+   * growth record (shieldCount) directly. (LENGTH_BOOST no longer exists —
+   * removed along with the fixed-length body system it grew.)
    */
   _onPowerUpCollectedInternal(socketId, type, durationMs, downstreamCallback) {
-    const { POWERUP_TYPES, SHIELD_MAX_STACK, LENGTH_BOOST_DELTA, GROWTH_MAX_LENGTH } =
-      require('./constants');
+    const { POWERUP_TYPES, SHIELD_MAX_STACK } = require('./constants');
 
     if (this._growth) {
       const g = this._growth.get(socketId);
-      if (g) {
-        if (type === POWERUP_TYPES.SHIELD) {
-          g.shieldCount = Math.min(SHIELD_MAX_STACK, g.shieldCount + 1);
-          this._onPlayerGrowth(socketId, { ...g });
-        } else if (type === POWERUP_TYPES.LENGTH_BOOST) {
-          // +0.20 lengthMultiplier → +20% bodyLengthPx (and +20% body radius,
-          // same multiplier drives both). Capped at GROWTH_MAX_LENGTH (2.5x).
-          g.lengthMultiplier = Math.min(
-            GROWTH_MAX_LENGTH,
-            g.lengthMultiplier + LENGTH_BOOST_DELTA
-          );
-          this._onPlayerGrowth(socketId, { ...g });
-        }
+      if (g && type === POWERUP_TYPES.SHIELD) {
+        g.shieldCount = Math.min(SHIELD_MAX_STACK, g.shieldCount + 1);
+        this._onPlayerGrowth(socketId, { ...g });
       }
     }
 
@@ -446,47 +400,44 @@ class GameLoop {
   }
 
   /**
-   * Decimate a player's current body for network transmission.
-   * Server simulates every tick internally (collision needs full precision);
-   * clients only need enough points to draw the snake smoothly.
+   * Decimate a player's current (full, permanent) trail for network
+   * transmission. The server simulates and collides against every point
+   * ever laid this round; clients only need enough points to draw the
+   * trail smoothly.
    *
-   * Always includes the tail (index 0) and the most recent point (the point
-   * just behind the head) so the rendered body's endpoints are accurate,
-   * then samples every BODY_POINT_SAMPLE_STRIDE-th point in between, capped
-   * at BODY_POINT_MAX_SENT total points.
+   * Unlike the old fixed-length-body sampler (which used a flat fixed
+   * stride because the body was capped at a small, constant length), the
+   * trail here grows for the entire round — a flat stride would either
+   * truncate long trails or balloon payload size. Instead the stride is
+   * computed fresh from the trail's CURRENT length so a short trail is
+   * sent in near-full detail and a long trail is sent evenly decimated
+   * across its FULL length (spawn to head) — the client always sees the
+   * whole shape, just coarser as the round goes on.
+   *
+   * Always includes the first point (spawn) and the most recent point
+   * (just behind the head) so the rendered trail's endpoints are accurate.
    *
    * Each point is sent as a compact [x, y, r] array (not {x,y,r}) — roughly
-   * 43% smaller per point. Order: tail-to-head (index 0 = tail).
+   * 43% smaller per point. Order: oldest-to-newest (index 0 = first point
+   * laid this round).
    */
-  _sampleBodyPoints(body) {
+  _sampleTrailPoints(trail) {
     const toArr = p => [+p.x.toFixed(1), +p.y.toFixed(1), +(p.r ?? PLAYER_RADIUS).toFixed(1)];
 
-    if (body.length <= 2) {
-      return body.map(toArr);
+    if (trail.length <= TRAIL_POINT_MAX_SENT) {
+      return trail.map(toArr);
     }
 
-    const sampled = [body[0]]; // tail
-    for (let i = BODY_POINT_SAMPLE_STRIDE; i < body.length - 1; i += BODY_POINT_SAMPLE_STRIDE) {
-      sampled.push(body[i]);
+    // Long trail — compute a stride from current length so the WHOLE trail
+    // (not just a recent window) is represented, just more coarsely.
+    const stride = trail.length / TRAIL_POINT_MAX_SENT;
+    const sampled = [];
+    for (let i = 0; i < TRAIL_POINT_MAX_SENT - 1; i++) {
+      sampled.push(trail[Math.floor(i * stride)]);
     }
-    sampled.push(body[body.length - 1]); // most recent (near head)
+    sampled.push(trail[trail.length - 1]); // always keep the most recent (near-head) point
 
-    // Enforce hard cap — if still too many, re-sample evenly across `sampled`
-    let result = sampled;
-    if (result.length > BODY_POINT_MAX_SENT) {
-      const stride = result.length / BODY_POINT_MAX_SENT;
-      const capped = [];
-      // Fill BODY_POINT_MAX_SENT - 1 slots by even sampling, then append the
-      // final point explicitly — guarantees exactly BODY_POINT_MAX_SENT total
-      // while always preserving the most recent (near-head) point.
-      for (let i = 0; i < BODY_POINT_MAX_SENT - 1; i++) {
-        capped.push(result[Math.floor(i * stride)]);
-      }
-      capped.push(result[result.length - 1]);
-      result = capped;
-    }
-
-    return result.map(toArr);
+    return sampled.map(toArr);
   }
 
   _buildSnapshot() {
@@ -494,6 +445,7 @@ class GameLoop {
     for (const [, p] of this._players) {
       const growth = this._growth?.get(p.id);
       const lengthMultiplier = growth?.lengthMultiplier ?? 1.0;
+      const sampledTrail = this._sampleTrailPoints(this._trails.get(p.id) ?? []);
       players.push({
         id:                p.id,
         wallet:            p.wallet,
@@ -502,9 +454,16 @@ class GameLoop {
         y:                 +p.y.toFixed(2),
         angle:             +p.angle.toFixed(4),
         alive:             p.alive,
-        bodyLengthPx:      +(BASE_BODY_LENGTH_PX * lengthMultiplier).toFixed(1),
+        // Classic mode has no body-length mechanic. lengthMultiplier is kept
+        // at a constant 1.0 purely for frontend backward compatibility —
+        // never collision/render relevant, never changes.
         lengthMultiplier,
-        bodyPoints:        this._sampleBodyPoints(this._bodies.get(p.id) ?? []),
+        // Permanent, lethal trail for this round — use for collision and
+        // rendering. trailPoints is the new, clearer name; bodyPoints is
+        // kept as an identical alias so existing frontend code that reads
+        // bodyPoints (from the snake-body era) keeps working unmodified.
+        trailPoints:       sampledTrail,
+        bodyPoints:        sampledTrail,
         activePowerups:    this._pum.getActivePowerUpsArray(p.id),
         shieldCount:       growth?.shieldCount ?? 0,
       });
