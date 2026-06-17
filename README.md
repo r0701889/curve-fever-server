@@ -1,96 +1,254 @@
-# curve-fever-server — social invite bridge
+# Curve Fever — Authoritative Game Server
 
-Drop these two files into your repo at the exact paths shown — both
-replace existing files in place. Nothing else in this repo changed: not
-Room.js, RoomManager, GameLoop, collision.js, ArenaManager, PowerUpManager,
-joinRoom, acceptInvite, ready flow, or anything payment-related.
+Authoritative multiplayer game server for a classic Curve Fever-style game, built for the **Emblem / GameHub** platform.
+Built with **Node.js**, **Express**, and **Socket.io**. Ready for **Railway** deployment.
 
-## The problem this solves
+Curve Fever is one of (currently) two games on GameHub — the other being **Bomberman** (`bomberman-server`, a separate repo/Railway service). Both game servers are independent and gameplay-only; wallets, payments, friends/chat, lobbies, treasury, payouts, and match history all live in the shared **Emblem** backend, which this server talks to via `services/BackendClient.js`.
 
-The existing `sendInvite` handler already emits `inviteReceived` directly
-to the target's game socket — but only if the target already has a game
-client open. If they're just browsing the lobby/dashboard in Emblem with
-no game socket connected, they never see the invite at all. The fix isn't
-to change that existing path — it's to add a second, independent push
-through the backend's new `/social` SSE channel (see the companion
-package, `curve-fever-backend-social-realtime`), which reaches the target
-regardless of whether they have a game client open.
+---
 
-## What's new
-
-**`src/services/BackendClient.js`** — one new method:
+## Architecture
 
 ```
-notifySocial(event, targetWallet, payload)
+src/
+├── index.js                  # Express + Socket.io bootstrap
+├── game/
+│   ├── constants.js          # All tuneable game values
+│   ├── GameLoop.js           # Authoritative 60-tick game loop (per round)
+│   ├── ArenaManager.js       # Shrinking-arena phase cycle (safe/warning/shrink)
+│   ├── PowerUpManager.js     # Power-up spawning, collection, active effects
+│   ├── collision.js          # Wall & trail collision detection
+│   └── spawn.js              # Safe player spawn positions
+├── rooms/
+│   ├── Room.js               # Lobby + multi-round match lifecycle per room
+│   ├── RoomManager.js        # Creates/tracks all rooms
+│   └── socketHandlers.js     # Socket event wiring
+└── services/
+    └── BackendClient.js      # Calls into the shared Emblem backend (match registration, payouts)
 ```
 
-Follows the exact same `post()` helper and error-swallowing pattern as
-every other method in this file (`startMatch`, `cancelMatch`, etc.).
-Best-effort and fire-and-forget — it never throws. A backend hiccup here
-can't affect the invite itself, because the existing `inviteReceived`
-emit already happened separately, synchronously, before this is even
-called.
+The server is **fully authoritative**:
+- Client sends only `direction: 'left' | 'right' | 'neutral'`
+- Server calculates position, angle, trail, collisions, power-ups, and round/match results
+- Server determines the winner and reports it to Emblem for payout — no client input is trusted
 
-**`src/rooms/socketHandlers.js`** — inside the existing `sendInvite`
-handler, strictly *after* its existing validation and *after* the
-existing `inviteReceived` emit (both untouched, byte-identical to
-before), one new block calls `notifySocial()` with a `roomInviteReceived`
-payload:
+---
 
-- `roomId` — the actual room, from `room.roomId`.
-- `hostWallet` / `hostUsername` — resolved from the lobby's actual host
-  (`lobbyState.players.find(p => p.socketId === lobbyState.hostId)`), not
-  just defaulted to the inviter — `sendInvite` doesn't require the sender
-  to be the host, so these can legitimately differ.
-- `entryFee`, `playerCount`, `maxPlayers` — read straight from the live
-  lobby state, same source the existing `inviteReceived` event already
-  uses.
-- `gameType` — hardcoded to `'curve_fever'` for now. There's only one game
-  today; this is a one-line change whenever that stops being true.
-- `expiresAt` — `Date.now() + 3 minutes` (confirmed default), a new local
-  constant (`INVITE_EXPIRY_MS`), not added to `game/constants.js` since
-  it isn't a physics/gameplay constant.
+## Quick Start
 
-The header doc comment for `inviteReceived` got a short note added
-pointing at this — the event itself, its field names, and everything it
-sends are unchanged.
+```bash
+npm install
+cp .env.example .env        # edit FRONTEND_URL and the Emblem backend vars below
+npm start                   # or: npm run dev
+```
 
-## Field names are deliberately not unified
+### Environment variables
 
-The existing `inviteReceived` event uses `fromWallet`/`fromUsername`/
-`playersCount`/`rounds`, no `gameType`, no `expiresAt`. The new
-`roomInviteReceived` event uses `hostWallet`/`hostUsername`/`playerCount`/
-`gameType`/`expiresAt`, per your spec. Two channels, two payload shapes,
-on purpose — aligning them would mean changing the existing, already-
-shipped event, which this round's instructions explicitly excluded.
+| Variable | Required | Description |
+|---|---|---|
+| `FRONTEND_URL` | yes | Your Emblem Build URL, for CORS (e.g. `https://emblem-build.vercel.app`) |
+| `PORT` | no | Injected automatically by Railway — do **not** set it manually |
+| `BACKEND_URL` | yes | Base URL of the shared Emblem backend (match registration / payouts) |
+| `SERVER_SECRET` | yes | Shared secret used to authenticate this game server to Emblem |
+| `RAILWAY_INTERNAL_TOKEN` | yes | Token required for the `/finish` (payout) call to be accepted |
 
-## What's NOT done yet — flagging on purpose, not silently skipped
+Without the three Emblem-related variables set, the server still runs and plays games fine, but match registration/payout calls to Emblem will be skipped or rejected — set them in Railway's **Variables** tab for production use.
 
-**Expiry is informational only.** `expiresAt` is sent in the payload for
-the frontend to act on (grey out / remove the invite client-side), but
-nothing server-side rejects a join attempt after that time. Enforcing
-that would mean touching `joinRoom`/`acceptInvite`, which this round's
-instructions explicitly excluded. Say the word if you want it enforced
-next — it'd be a small, self-contained addition (an in-memory map of
-target wallet → expiry, checked at the top of `joinRoom`/`acceptInvite`).
+---
 
-**No friendship-gating.** Per the approved plan, `sendInvite` still only
-checks that the target is online and registered (`UserRegistry`), same as
-before — it does not verify the target is actually the sender's friend.
-Adding that would mean a synchronous game-server → backend call on every
-invite (new latency, new failure mode if the backend is briefly down),
-which you asked to leave for a later pass.
+## Deploy to Railway
 
-## Tested before packaging
+1. Push this repo to GitHub
+2. Create a new Railway project → **Deploy from GitHub repo**
+3. Set the environment variables above in the Railway **Variables** tab
+4. Railway picks up `railway.toml` and runs `npm start`
 
-Spawned the real backend as a child process and wired the real
-`RoomManager`/`UserRegistry`/`socketHandlers` against it — no mocks on
-either side. Created a room, registered a second wallet without joining
-it, sent an invite, and confirmed both the existing `inviteReceived`
-game-socket emit (verified its payload is exactly the original shape,
-nothing new leaked in) and the new `roomInviteReceived` landing on a real
-SSE connection on the real backend, carrying the correct room id, host
-wallet/username, entry fee, player/capacity counts, and an expiry roughly
-3 minutes out. Then re-ran `joinRoom` and `acceptInvite` against that same
-live room and confirmed both still work exactly as before. 13 assertions,
-all passing.
+Health check endpoint: `GET /` → `Curve server running`
+
+---
+
+## Match Flow
+
+```
+Lobby
+  ↓
+Players ready
+  ↓
+Countdown (gameStarting → gameStarted)
+  ↓
+Round starts (roundStarted)
+  ↓
+Players eliminate each other via trail/wall collisions
+  ↓
+One player survives → roundEnded
+  ↓
+Repeat until a player reaches winsRequired (Bo1/Bo3/Bo5/Bo7/Bo9)
+  ↓
+matchEnded → Emblem payout flow (winnerWallet, 95% winner / 5% platform)
+```
+
+Round format is configurable per room (`setRounds`) from `VALID_ROUNDS = [1, 3, 5, 7, 9]`; `winsRequired` is `Math.ceil(rounds / 2)`.
+
+---
+
+## Socket.io Events
+
+### Client → Server
+
+| Event | Payload | Description |
+|---|---|---|
+| `createRoom` | `{ wallet, username, rounds, entryFee }` | Create a new lobby room |
+| `joinRoom` | `{ roomId, wallet, username }` | Join an existing room |
+| `setReady` | `{ ready: boolean }` | Toggle ready state in lobby |
+| `setRounds` | `{ rounds }` | Host changes the Bo-N format (lobby only) |
+| `startGame` | _(none)_ | Host starts the game (begins the pre-game countdown) |
+| `playerInput` | `{ direction: 'left'\|'right'\|'neutral' }` | Steering input (send every frame) |
+| `playAgain` | `{ wallet }` | Join/create a rematch lobby after `matchEnded` |
+| `exitMatch` | _(none)_ | Leave the room |
+
+### Server → Client
+
+| Event | Payload | Description |
+|---|---|---|
+| `lobbyState` | see below | Full lobby snapshot, broadcast on any roster/format change |
+| `gameStarting` | `{ roomId, gameStartAt, countdownSeconds, players[], scoreboard[] }` | Pre-game countdown begins |
+| `gameStarted` | `{ roomId, rounds, winsRequired, scoreboard[], players[] }` | Match begins (round 1 about to start) |
+| `roundStarted` | `{ roomId, currentRound, rounds, winsRequired, scoreboard[] }` | A new round's `GameLoop` has started |
+| `gameState` | see below | 20× per second during gameplay |
+| `playerDied` | `{ socketId, wallet, reason }` | A player died this round |
+| `powerUpsUpdate` | `{ powerUps[] }` | Power-ups currently on the map changed |
+| `powerUpCollected` | `{ socketId, playerWallet, playerUsername, type, duration }` | A player picked up a power-up |
+| `powerUpExpired` | `{ socketId, playerWallet, type }` | A timed power-up effect wore off |
+| `powerUpUsed` | `{ socketId, playerWallet, type }` | A power-up effect was actively triggered |
+| `scoreboardUpdate` | `{ scoreboard[] }` | Scoreboard changed (death, power-up, etc.) |
+| `roundEnded` | `{ roomId, roundWinnerWallet, roundWinnerId, draw, scoreboard[], currentRound, rounds, winsRequired, matchOver, nextRoundStartsAt, countdownSeconds }` | A round concluded |
+| `matchEnded` | `{ roomId, winnerWallet, winnerId, draw, scoreboard[], totalRounds, rounds }` | Match result (authoritative) — triggers the Emblem payout call |
+| `rematchLobbyCreated` | `{ roomId, lobbyState }` | First player started a rematch lobby |
+| `rematchJoined` | `{ roomId, lobbyState }` | You joined an existing rematch lobby |
+| `errorMessage` | `{ message }` | Error feedback to client |
+
+---
+
+## lobbyState shape
+
+```jsonc
+{
+  "roomId": "A3F2B1C4",
+  "hostId": "<socketId>",
+  "state": "lobby",              // "lobby" | "starting" | "playing" | "between_rounds" | "ended"
+  "entryFee": 1,
+  "matchId": "A3F2B1C4",
+  "rounds": 3,
+  "winsRequired": 2,
+  "currentRound": 0,
+  "gameStartAt": null,
+  "countdownSeconds": null,
+  "scoreboard": [
+    { "wallet": "0x...", "username": "...", "color": "#FF4D4D",
+      "wins": 0, "alive": true, "activePowerUp": null,
+      "lengthMultiplier": 1.0, "speedMultiplier": 1.0,
+      "shieldCount": 0, "eliminations": 0, "rank": 1 }
+  ],
+  "players": [
+    { "socketId": "...", "wallet": "0x...", "username": "...", "ready": false, "color": "#FF4D4D" }
+  ]
+}
+```
+
+`lengthMultiplier` is kept at a constant `1.0` for frontend backward compatibility — classic permanent-trail mode has no body-length mechanic to grow, so this field is never collision- or render-relevant. Eliminations grant a small permanent **speed** bonus instead (capped at 1.25×), not a length bonus.
+
+## gameState shape (emitted 20×/sec; physics simulated at 60 ticks/sec)
+
+```jsonc
+{
+  "tick": 142,
+  "players": [
+    { "id": "...", "wallet": "0x...", "color": "#FF4D4D",
+      "x": 312.40, "y": 201.80, "angle": 1.5708, "alive": true,
+      "lengthMultiplier": 1.0,
+      "trailPoints": [ [310.2, 199.5, 3], [311.0, 200.1, 3] ],
+      "bodyPoints":  [ [310.2, 199.5, 3], [311.0, 200.1, 3] ],
+      "activePowerups": [ { "type": "speed_boost", "expiresAt": 1750000000000 } ],
+      "shieldCount": 0 }
+  ],
+  "powerUps": [ { "id": "...", "type": "shield", "x": 400, "y": 300 } ],
+  "arena": { "x": 0, "y": 0, "width": 1400, "height": 1050, "phase": "safe" },
+  "scoreboard": [ /* same shape as lobbyState.scoreboard */ ]
+}
+```
+
+The trail is **permanent for the round** — it persists for the entire round and is never trimmed by length or age; it only resets when a new round starts. `trailPoints` and `bodyPoints` carry identical data (`[x, y, r]` triples); `bodyPoints` is kept purely as a backward-compatible alias from the earlier fixed-length-body version of this game, for any frontend code still reading that field name. Because a permanent trail can grow large over a long round, the broadcast trail is **decimated** (capped at `TRAIL_POINT_MAX_SENT` points per player) — the server always collides against the full, untrimmed trail internally; only what's sent over the wire is sampled down, evenly across the trail's full length so the client always sees its whole shape.
+
+---
+
+## Game Constants (src/game/constants.js)
+
+| Constant | Default | Description |
+|---|---|---|
+| `ARENA_WIDTH` / `ARENA_HEIGHT` | 1400 / 1050 | Starting arena size in px (4:3-ish, widened to keep the early game open now that trails are permanent) |
+| `ARENA_MIN_WIDTH` / `ARENA_MIN_HEIGHT` | 580 / 440 | Arena never shrinks smaller than this |
+| `ARENA_SHRINK_RATIO` | 0.85 | Each shrink cycle keeps 85% of width and height |
+| `ARENA_FIRST_SHRINK_AFTER_MS` | 30000 | Delay before the first shrink cycle begins |
+| `ARENA_SAFE_MS` / `ARENA_WARNING_MS` / `ARENA_SHRINK_MS` | 30000 / 5000 / 10000 | Phase durations in the shrink cycle |
+| `TICK_RATE` | 60 | Physics ticks per second |
+| `PLAYER_SPEED_PPS` | 75 | Player speed in px/sec |
+| `TURN_RATE_RPS` | 1.65 | Steering rate in radians/sec |
+| `PLAYER_RADIUS` | 3 px | Collision radius |
+| `TRAIL_SELF_SKIP_POINTS` | 8 | Most-recent own-trail points excluded from self-collision |
+| `TRAIL_POINT_MAX_SENT` | 220 | Hard cap on trail points sent per player per broadcast |
+| `MIN_PLAYERS` / `MAX_PLAYERS` | 2 / 6 | Players per room |
+| `VALID_ROUNDS` | [1, 3, 5, 7, 9] | Selectable Bo-N match formats |
+| `PRE_GAME_COUNTDOWN_MS` | 5000 | Synchronized countdown before `gameStarted` |
+| `BETWEEN_ROUNDS_DELAY_MS` | 10000 | Delay between rounds in a multi-round match |
+| `POST_MATCH_GRACE_MS` | 60000 | How long a room stays alive after `matchEnded`, for rematch |
+| `SHIELD_MAX_STACK` | 3 | Max simultaneous shields a player can hold |
+| `GROWTH_SPEED_PER_ELIMINATION` / `GROWTH_MAX_SPEED` | 0.05 / 1.25 | Permanent speed bonus per kill, capped |
+
+---
+
+## Power-ups
+
+| Type | Effect | Duration |
+|---|---|---|
+| `ghost` | Pass through trails temporarily | 2s |
+| `nitro` | Large speed burst (+50%) | 2s |
+| `speed_boost` | Moderate speed buff (+15%) | 8s |
+| `shield` | Blocks one trail/wall collision; stacks up to `SHIELD_MAX_STACK` | counter, not timed |
+| `fat_trail` | Widens this player's new trail segments | 6s |
+| `tiny_trail` | Narrows this player's new trail segments | 6s |
+
+All power-ups are server-authoritative — spawn timing/position, collection, and effect application all happen in `PowerUpManager`/`GameLoop`; the client only renders what it's told.
+
+---
+
+## Frontend Integration Tips
+
+```js
+import { io } from 'socket.io-client';
+
+const socket = io('https://your-railway-url.railway.app');
+
+// Create room
+socket.emit('createRoom', { wallet: '0xYourWallet', username: 'Player1', rounds: 3, entryFee: 1 });
+socket.on('lobbyState', (lobbyState) => { /* ... */ });
+
+// Send input — call this in your game loop (requestAnimationFrame)
+function gameLoop() {
+  const dir = getInput(); // 'left' | 'right' | 'neutral'
+  socket.emit('playerInput', { direction: dir });
+  requestAnimationFrame(gameLoop);
+}
+
+// Render game state
+socket.on('gameState', ({ tick, players, powerUps, arena }) => {
+  render(players, powerUps, arena);
+});
+
+socket.on('roundEnded', ({ roundWinnerWallet, matchOver, draw }) => {
+  console.log(draw ? 'Round draw!' : `Round winner: ${roundWinnerWallet}`, { matchOver });
+});
+
+socket.on('matchEnded', ({ winnerWallet, draw }) => {
+  console.log(draw ? 'Match draw!' : `Match winner: ${winnerWallet}`);
+});
+```
