@@ -18,6 +18,7 @@ const { collidesWithWall, collidesWithBody } = require('./collision');
 const { generateSpawns }  = require('./spawn');
 const { PowerUpManager }  = require('./PowerUpManager');
 const { ArenaManager }    = require('./ArenaManager');
+const { TrailGrid }       = require('./TrailGrid');
 
 /**
  * GameLoop
@@ -55,21 +56,25 @@ const { ArenaManager }    = require('./ArenaManager');
  *
  *   Each player independently alternates between two phases:
  *     'solid' — trail is being laid normally. Lasts TRAIL_GAP_INTERVAL_MIN_MS
- *               to TRAIL_GAP_INTERVAL_MAX_MS (randomised per player, per
- *               occurrence), then a gap begins.
+ *               to TRAIL_GAP_INTERVAL_MAX_MS (3-6s, randomised per player,
+ *               per occurrence), then a gap begins.
  *     'gap'   — trail generation pauses. The player's head keeps moving and
  *               keeps colliding against the wall and *other* lethal trail
  *               points exactly as normal, but no new point is appended for
  *               their own trail, so this stretch is invisible and passable.
- *               Lasts TRAIL_GAP_DURATION_MIN_MS to TRAIL_GAP_DURATION_MAX_MS,
- *               then a new solid stretch begins.
+ *               Lasts TRAIL_GAP_DURATION_MIN_MS to TRAIL_GAP_DURATION_MAX_MS
+ *               (100-300ms), then a new solid stretch begins.
  *
  *   This scheduling lives entirely in GameLoop (this._gapState, populated in
  *   _initPlayers and advanced in _step via _advanceGapState). The client has
  *   no say in when gaps happen and never invents them locally — it only ever
  *   renders/collides against the trail points the server actually sent, and
  *   gap stretches were never points to begin with, so there is nothing
- *   "invisible" being sent over the wire to hide.
+ *   "invisible" being sent over the wire to hide. The point right before a
+ *   gap starts and the point right after it ends are flagged (segmentEnd /
+ *   segmentStart) so network decimation (_sampleTrailPoints) can never
+ *   accidentally erase a gap's boundary on a long trail — see that
+ *   function's docs.
  *
  * ── Network payload ──────────────────────────────────────────────────────────
  *
@@ -87,6 +92,11 @@ const { ArenaManager }    = require('./ArenaManager');
  *   - Head vs ANY current trail point (self or other), across the player's
  *     ENTIRE trail this round — collidesWithBody, now given the full
  *     unbounded (gapped) _trails map instead of a fixed-length body map.
+ *     Backed by this._trailGrid (a TrailGrid spatial index, see TrailGrid.js)
+ *     so the per-tick cost stays roughly constant as a round goes on instead
+ *     of scaling with total points ever laid — without that, permanent
+ *     trails would make collision checks progressively more expensive over
+ *     the course of a long round.
  *   - Self-collision skips a small FIXED window of points immediately
  *     behind the head (TRAIL_SELF_SKIP_POINTS) — these are always within
  *     head-radius due to continuous movement and are not real collisions.
@@ -158,6 +168,12 @@ class GameLoop {
     this._players = new Map();
     this._trails  = new Map();  // socketId -> [{x,y,r}], permanent for the round (gapped)
     this._inputs  = new Map();
+    // Spatial index over every point in every trail, rebuilt fresh per
+    // round (new GameLoop = new TrailGrid, matching "trails clear only on
+    // new round" exactly). Purely an accelerator for collidesWithBody /
+    // _findBodyOwner — does not change what is stored or for how long; see
+    // TrailGrid.js for why this is needed once trails stop being trimmed.
+    this._trailGrid = new TrailGrid();
 
     // Per-player trail-gap scheduler state. socketId -> {
     //   phase: 'solid' | 'gap',
@@ -194,6 +210,7 @@ class GameLoop {
     this._trails.clear();
     this._inputs.clear();
     this._gapState.clear();
+    this._trailGrid.clear();
 
     const now = Date.now();
 
@@ -212,7 +229,8 @@ class GameLoop {
       // also what makes "new round clears trails" work: GameLoop is
       // reconstructed fresh per round by Room._startRound(), so every
       // round starts every player's trail back down to this one point.
-      this._trails.set(id, [{ x: spawn.x, y: spawn.y, r: PLAYER_RADIUS }]);
+      this._trails.set(id, [{ x: spawn.x, y: spawn.y, r: PLAYER_RADIUS, segmentStart: true }]);
+      this._trailGrid.insert(id, 0, spawn.x, spawn.y, PLAYER_RADIUS);
       this._inputs.set(id, 'neutral');
 
       // Roll an independent first "solid" stretch for this player so gaps
@@ -305,7 +323,7 @@ class GameLoop {
       //    a head moving through one of its own gaps naturally has nothing
       //    to collide with there — no extra branching needed here.
       if (!this._pum.hasGhost(id)) {
-        if (collidesWithBody(newX, newY, this._trails, id)) {
+        if (collidesWithBody(newX, newY, this._trails, id, PLAYER_RADIUS, this._trailGrid)) {
           if (this._consumeShield(id)) {
             // Shield absorbed the hit — player survives, no elimination credit
           } else {
@@ -332,7 +350,8 @@ class GameLoop {
       const inGap = this._advanceGapState(id);
       if (!inGap) {
         const pointR = this._pum.getTrailRadius(id, PLAYER_RADIUS);
-        this._pushTrailPoint(id, newX, newY, pointR);
+        const segmentStart = this._consumeJustResumed(id);
+        this._pushTrailPoint(id, newX, newY, pointR, segmentStart);
       }
     }
 
@@ -368,6 +387,12 @@ class GameLoop {
    * Date.now() and this player's own previous phase/timer — nothing the
    * client sends has any influence here.
    *
+   * Also sets state.justResumed = true on the exact tick a gap ends and
+   * solid resumes — _step reads this once (via _consumeJustResumed) so the
+   * very next pushed point can be tagged as a new dash segment's start.
+   * This is what lets _sampleTrailPoints guarantee a gap boundary is never
+   * silently merged away by decimation (see that function's docs).
+   *
    * @param {string} socketId
    * @returns {boolean} true if currently in a gap (skip laying a point)
    */
@@ -380,13 +405,34 @@ class GameLoop {
       if (state.phase === 'solid') {
         state.phase       = 'gap';
         state.phaseEndsAt = now + this._randomGapDurationMs();
+        // The last point already in the trail (pushed on a previous tick,
+        // before this transition) is the dash's final point. Flag it so
+        // the sampler never decimates it away — without this, a long
+        // round could silently lose the exact point where a gap begins.
+        const trail = this._trails.get(socketId);
+        if (trail && trail.length > 0) {
+          trail[trail.length - 1].segmentEnd = true;
+        }
       } else {
         state.phase       = 'solid';
         state.phaseEndsAt = now + this._randomSolidDurationMs();
+        state.justResumed = true;
       }
     }
 
     return state.phase === 'gap';
+  }
+
+  /**
+   * One-shot read of the "just resumed from a gap" flag set by
+   * _advanceGapState, consumed immediately so it only ever applies to the
+   * single point laid on the tick the gap actually ended.
+   */
+  _consumeJustResumed(socketId) {
+    const state = this._gapState.get(socketId);
+    if (!state || !state.justResumed) return false;
+    state.justResumed = false;
+    return true;
   }
 
   // ─── Trail helpers ───────────────────────────────────────────────────────────
@@ -395,10 +441,19 @@ class GameLoop {
    * Append a new point to the trail. Classic Curve Fever — no trimming, no
    * length cap, no expiry. The trail simply grows for the entire round,
    * except during a gap stretch, when _step skips calling this entirely.
+   *
+   * `segmentStart` marks the first point of a new dash (round start, or
+   * the tick a gap just ended) — see _sampleTrailPoints for why decimation
+   * needs to know this to avoid silently erasing a gap's visible boundary.
+   *
+   * Also indexes the point into this._trailGrid (O(1)) so collision queries
+   * never need to re-scan the full trail array — see TrailGrid.js.
    */
-  _pushTrailPoint(socketId, x, y, r) {
+  _pushTrailPoint(socketId, x, y, r, segmentStart = false) {
     const trail = this._trails.get(socketId);
-    trail.push({ x, y, r });
+    const index = trail.length;
+    trail.push({ x, y, r, segmentStart });
+    this._trailGrid.insert(socketId, index, x, y, r);
   }
 
   // ─── Growth helpers ──────────────────────────────────────────────────────────
@@ -448,27 +503,36 @@ class GameLoop {
    * Self-trail SKIP applies (same fixed window as collidesWithBody) — this
    * is checked against the player's ENTIRE trail this round, not a window.
    * Gap stretches contain no points, so they're naturally never considered.
+   *
+   * Uses the same TrailGrid as collidesWithBody to avoid a second full scan
+   * of every point laid this round — this only runs once per death (not
+   * every tick), but on a long round the full trail set can still be large
+   * enough that a brute-force fallback would be a needless cost right at
+   * the moment a kill is being attributed.
    */
   _findBodyOwner(x, y, victimId) {
+    const maxQueryRadius = PLAYER_RADIUS * 4; // generous bound, mirrors collision.js
+    const candidates = this._trailGrid.queryNearby(x, y, maxQueryRadius);
+
     let bestOwner = null;
     let bestDistSq = Infinity;
 
-    for (const [ownerId, trail] of this._trails) {
-      const limit = ownerId === victimId
-        ? Math.max(0, trail.length - TRAIL_SELF_SKIP_POINTS)
-        : trail.length;
+    for (const candidate of candidates) {
+      if (candidate.ownerId === victimId) {
+        const ownerBody = this._trails.get(victimId);
+        const skipLimit = ownerBody ? Math.max(0, ownerBody.length - TRAIL_SELF_SKIP_POINTS) : 0;
+        if (candidate.index >= skipLimit) continue;
+      }
 
-      for (let i = 0; i < limit; i++) {
-        const pt = trail[i];
-        const dx = x - pt.x;
-        const dy = y - pt.y;
-        const d2 = dx * dx + dy * dy;
-        if (d2 < bestDistSq) {
-          bestDistSq = d2;
-          bestOwner  = ownerId;
-        }
+      const dx = x - candidate.x;
+      const dy = y - candidate.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestDistSq) {
+        bestDistSq = d2;
+        bestOwner  = candidate.ownerId;
       }
     }
+
     return bestOwner;
   }
 
@@ -517,11 +581,18 @@ class GameLoop {
    * ever laid this round (minus gaps); clients only need enough points to
    * draw the trail smoothly.
    *
-   * Because gap stretches were never appended as points in the first place,
-   * this function has nothing extra to filter — every point already in the
-   * array is real, currently-visible/lethal trail, and decimating it simply
-   * thins out dense stretches while leaving the dash pattern's actual gaps
-   * as the natural absence of points they always were.
+   * Gap boundaries are NEVER decimated away: every point flagged
+   * segmentStart (round start, or the tick right after a gap ends) or
+   * segmentEnd (the tick right before a gap begins) is always included,
+   * regardless of stride. Earlier versions of this sampler picked points
+   * purely by array index (Math.floor(i * stride)) with no awareness of
+   * where a dash actually starts or ends — on a long trail, decimation
+   * could land on either side of a gap and skip straight past its
+   * boundary points, leaving the client unable to tell (via the
+   * "distance between consecutive points" rule) whether it's looking at a
+   * real gap or just a coarse sampling step. Always keeping both edges of
+   * every dash fixes that: the distance-jump heuristic stays reliable no
+   * matter how aggressively the rest of a long trail gets thinned.
    *
    * Unlike the old fixed-length-body sampler (which used a flat fixed
    * stride because the body was capped at a small, constant length), the
@@ -530,17 +601,31 @@ class GameLoop {
    * computed fresh from the trail's CURRENT length so a short trail is
    * sent in near-full detail and a long trail is sent evenly decimated
    * across its FULL length (spawn to head) — the client always sees the
-   * whole shape, just coarser as the round goes on.
+   * whole shape, just coarser as the round goes on, MINUS the boundary
+   * points above which are always kept on top of the strided sample.
    *
    * Always includes the first point (spawn) and the most recent point
    * (just behind the head) so the rendered trail's endpoints are accurate.
    *
-   * Each point is sent as a compact [x, y, r] array (not {x,y,r}) — roughly
-   * 43% smaller per point. Order: oldest-to-newest (index 0 = first point
-   * laid this round).
+   * Each point is sent as a compact [x, y, r, gapFlag] array (not
+   * {x,y,r}) — still far smaller than objects per point, with a 4th slot
+   * carrying 1 (segment boundary — start or end of a dash) or 0 (an
+   * ordinary mid-dash point) so the client never has to infer gap
+   * boundaries purely from a distance heuristic; it can use the flag as a
+   * hint and the distance check as a fallback/sanity check. x/y are kept
+   * to 2 decimal places (was 1) — at typical devicePixelRatio of 2-3 on
+   * high-DPI displays, 1-decimal rounding could show as a faint stair-step
+   * on round line joins; 2 decimals is comfortably sub-pixel at any sane
+   * zoom level for negligible extra payload. Order: oldest-to-newest
+   * (index 0 = first point laid this round).
    */
   _sampleTrailPoints(trail) {
-    const toArr = p => [+p.x.toFixed(1), +p.y.toFixed(1), +(p.r ?? PLAYER_RADIUS).toFixed(1)];
+    const toArr = p => [
+      +p.x.toFixed(2),
+      +p.y.toFixed(2),
+      +(p.r ?? PLAYER_RADIUS).toFixed(2),
+      (p.segmentStart || p.segmentEnd) ? 1 : 0,
+    ];
 
     if (trail.length <= TRAIL_POINT_MAX_SENT) {
       return trail.map(toArr);
@@ -549,13 +634,20 @@ class GameLoop {
     // Long trail — compute a stride from current length so the WHOLE trail
     // (not just a recent window) is represented, just more coarsely.
     const stride = trail.length / TRAIL_POINT_MAX_SENT;
-    const sampled = [];
+    const pickedIndices = new Set();
     for (let i = 0; i < TRAIL_POINT_MAX_SENT - 1; i++) {
-      sampled.push(trail[Math.floor(i * stride)]);
+      pickedIndices.add(Math.floor(i * stride));
     }
-    sampled.push(trail[trail.length - 1]); // always keep the most recent (near-head) point
+    pickedIndices.add(trail.length - 1); // always keep the most recent (near-head) point
 
-    return sampled.map(toArr);
+    // Always keep every gap-boundary point regardless of stride — see docs
+    // above for why silently losing these breaks the client's gap detection.
+    for (let i = 0; i < trail.length; i++) {
+      if (trail[i].segmentStart || trail[i].segmentEnd) pickedIndices.add(i);
+    }
+
+    const sorted = [...pickedIndices].sort((a, b) => a - b);
+    return sorted.map(i => toArr(trail[i]));
   }
 
   _buildSnapshot() {
@@ -582,11 +674,13 @@ class GameLoop {
         // and rendering. trailPoints is the new, clearer name; bodyPoints is
         // kept as an identical alias so existing frontend code that reads
         // bodyPoints (from the snake-body era) keeps working unmodified.
-        // Gaps in the dashed line are simply where consecutive points are
-        // far apart relative to PLAYER_SPEED — the client should NOT draw a
-        // connecting segment between two points whose distance exceeds a
-        // normal per-tick step, the same way it already must not draw across
-        // a brand-new round's reset point.
+        // Each entry is [x, y, r, gapFlag]. gapFlag is 1 on a dash's first
+        // or last point (round start, gap end, or gap start) and 0
+        // otherwise — a hint for where dashes begin/end. The client should
+        // still treat an unusually large jump between consecutive points
+        // as a gap regardless of the flag (defensive fallback), but no
+        // longer has to rely on that heuristic alone, since boundary
+        // points are now always preserved through server-side decimation.
         trailPoints:       sampledTrail,
         bodyPoints:        sampledTrail,
         activePowerups:    this._pum.getActivePowerUpsArray(p.id),

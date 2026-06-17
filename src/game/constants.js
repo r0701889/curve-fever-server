@@ -89,15 +89,15 @@ const TRAIL_SELF_SKIP_POINTS = 8;
 // never sends points for a gap stretch in the first place).
 //
 // Schedule (per player, independent):
-//   - Solid stretch for TRAIL_GAP_INTERVAL_MIN_MS–TRAIL_GAP_INTERVAL_MAX_MS,
-//     then a gap of TRAIL_GAP_DURATION_MIN_MS–TRAIL_GAP_DURATION_MAX_MS,
-//     then back to a solid stretch, repeating for the whole round.
+//   - Solid stretch for TRAIL_GAP_INTERVAL_MIN_MS–TRAIL_GAP_INTERVAL_MAX_MS
+//     (3–6s), then a gap of TRAIL_GAP_DURATION_MIN_MS–TRAIL_GAP_DURATION_MAX_MS
+//     (100–300ms), then back to a solid stretch, repeating for the whole round.
 //   - Each player rolls their own random next-interval/duration so players'
 //     gaps don't sync up.
-const TRAIL_GAP_INTERVAL_MIN_MS  = 2_000;   // shortest solid stretch before a gap
-const TRAIL_GAP_INTERVAL_MAX_MS  = 5_000;   // longest solid stretch before a gap
+const TRAIL_GAP_INTERVAL_MIN_MS  = 3_000;   // shortest solid stretch before a gap
+const TRAIL_GAP_INTERVAL_MAX_MS  = 6_000;   // longest solid stretch before a gap
 const TRAIL_GAP_DURATION_MIN_MS  = 100;     // shortest gap
-const TRAIL_GAP_DURATION_MAX_MS  = 250;     // longest gap
+const TRAIL_GAP_DURATION_MAX_MS  = 300;     // longest gap
 
 // Network payload: gameState.players[].trailPoints (bodyPoints is kept as an
 // identical alias for frontend backward compatibility — see GameLoop
@@ -124,6 +124,26 @@ const TRAIL_POINT_MAX_SENT = 220; // hard cap on points sent per player per broa
 // and MAX_PLAYERS=6, worst case is ≈ 220 * 16 * 6 ≈ 21KB per gameState
 // broadcast at the 20Hz send rate — acceptable for a 6-player room, and
 // numeric arrays compress well over the websocket transport's deflate.
+
+// ── Trail collision spatial grid ────────────────────────────────────────────
+//
+// Permanent trails never shrink during a round, so brute-force collision
+// (test every point of every player's full trail, every tick, for every
+// moving player) grows unbounded over the length of a round — O(total
+// points laid so far) per tick, repeated for every alive player. A uniform
+// spatial grid keyed by (floor(x/cell), floor(y/cell)) turns this into a
+// lookup of the ~9 cells around the head instead of a full scan, while
+// changing nothing about what is stored (no trimming, no caps on the trail
+// arrays themselves — only an index on top of them).
+//
+// Cell size is chosen relative to collision distances: heads and trail
+// points interact within roughly headRadius+pointRadius (a few px, up to
+// ~PLAYER_RADIUS*FAT_TRAIL_RADIUS_MULTIPLIER*2 ≈ 9px at the extreme), and
+// per-tick movement is PLAYER_SPEED (≈1.25px) up to Nitro's 1.5× (≈1.9px).
+// A cell size of 24px keeps each cell holding a handful of points even on
+// dense, slow-turning trails, while keeping the 3x3 neighbourhood query
+// comfortably larger than any realistic single-tick collision distance.
+const TRAIL_GRID_CELL_SIZE = 24;
 
 // ─── Room ─────────────────────────────────────────────────────────────────────
 
@@ -259,6 +279,7 @@ module.exports = {
   // Trail (classic, permanent, lethal)
   TRAIL_SELF_SKIP_POINTS,
   TRAIL_POINT_MAX_SENT,
+  TRAIL_GRID_CELL_SIZE,
   // Trail gaps (classic Curve Fever)
   TRAIL_GAP_INTERVAL_MIN_MS,
   TRAIL_GAP_INTERVAL_MAX_MS,
