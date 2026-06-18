@@ -5,7 +5,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "test": "node test/e2e.js && node test/e2e-rematch.js && node test/powerup.test.js && node test/e2e-invite.js && node test/e2e-multiround.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -17,7 +18,8 @@
     "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.0.1",
+    "socket.io-client": "^4.7.2"
   },
   "keywords": ["game", "multiplayer", "curve-fever", "socket.io"],
   "author": "",

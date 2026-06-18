@@ -67,6 +67,37 @@ Health check endpoint: `GET /` → `Curve server running`
 
 ---
 
+## Testing
+
+This repo includes end-to-end test suites that spin up the real server as a
+child process, drive it with real `socket.io-client` connections, and assert
+on the actual emitted events — no mocks of the game logic itself.
+
+```bash
+npm test
+```
+
+Runs, in order:
+- `test/e2e.js` — lobby → ready → countdown → round → movement → self-trail
+  collision → round end (covers the simultaneous-draw path)
+- `test/e2e-rematch.js` — a round with a clear winner → `matchEnded` →
+  `playAgain` → `rematchLobbyCreated`/`rematchJoined` → rematch-eligibility
+  rejection of an outside wallet → `exitMatch`
+- `test/powerup.test.js` — `PowerUpManager` spawning, max-on-map enforcement,
+  collection, Shield-as-counter semantics, category exclusivity (Nitro vs
+  Speed Boost), Ghost, and both map and player-effect expiry
+- `test/e2e-invite.js` — `sendInvite`/`acceptInvite`/`declineInvite` and their
+  guard rails (self-invite, offline target, missing room, username lookup)
+- `test/e2e-multiround.js` — `setRounds` (host-only, validated), and a full
+  BO3 match across two rounds with automatic round-to-round transition
+
+Each suite prints a pass/fail line per assertion and exits non-zero if
+anything fails. No `BACKEND_URL`/`SERVER_SECRET` is needed to run them — the
+Emblem backend calls are designed to no-op (with a warning log) when those
+env vars aren't set, which is exactly what the test runs exercise.
+
+---
+
 ## Match Flow
 
 ```
